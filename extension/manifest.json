@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Fast-Tabber",
-  "version": "0.3.1",
+  "version": "0.4.2",
   "description": "Manage and search Chrome tabs through local AI agents.",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsotBjEvQjDn6KR+1ZjzfNBSa8gEhHmox74dvBCBp9kY8yutvRC4mMovG04spdqrOTthoydhCBgiyRy8y44vuRvs/gSnBJy2sReH2o4/GKSJMScBHQISp5x+TG885F+MfjhgKwCj8kwzG4F0hYb/MCtjXtoTpqLreD4eeEMChy+OM4bhkv3pQZ37WXKuVinNUwip/3YLQVcAH6I+DNG8qG+EKEPTMZMSt2huimbnpl0ZRYVqrC8KUU9zZUUPdsVQAO8/O9F+2W9u1TWjDAE35TkAFiMtkVtQtPhSeeJlnbs3pcEJP0OSlnkjKUHLRFCB3Unhc1hTI0/Puzmtsps0k2wIDAQAB",

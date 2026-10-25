@@ -46,7 +46,7 @@ async def test_v2_groups_collections_duplicates_and_undo():
                 initial = await call("list_tabs", {"limit": 100})
                 assert initial["tabs"], "Chrome has no normal window for disposable integration tabs"
                 status = await call("browser_status")
-                assert status.get("stage") in {"v2", "v3"} and "group_action" in status.get("operations", []), \
+                assert status.get("stage") in {"v2", "v3", "v4"} and "group_action" in status.get("operations", []), \
                     "Reload the current extension before running V2 browser tests"
                 assert "tabGroups" in status.get("permissions", []), "Chrome tabGroups permission is missing"
                 window_id = initial["tabs"][0]["windowId"]

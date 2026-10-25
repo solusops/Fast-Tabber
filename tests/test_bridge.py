@@ -40,6 +40,9 @@ def test_tab_tools_are_bounded_and_task_oriented():
         }
         tool = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "list_tabs")
         assert tool["inputSchema"]["properties"]["limit"]["maximum"] == 100
+        tools = {item["name"]: item for item in response.json()["result"]["tools"]}
+        assert tools["index_tabs"]["annotations"]["readOnlyHint"] is False
+        assert tools["search_tabs"]["inputSchema"]["properties"]["mode"]["default"] == "keyword"
 
 
 def test_list_tabs_rejects_invalid_pagination():

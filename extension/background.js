@@ -16,7 +16,7 @@ async function probe() {
     tabCount: tabs.filter(tab => !tab.incognito).length,
     permissions: permissions.permissions,
     extensionVersion: chrome.runtime.getManifest().version,
-    stage: "v3",
+    stage: "v4",
     operations: ["list_tabs", "tab_action", "group_action", "move_tabs", "collection_action",
       "close_tabs", "find_duplicates", "restore_snapshot", "undo_last", "extract_tabs", "filter_tabs", "group_categories"],
   };
@@ -97,12 +97,12 @@ async function restoreSnapshot(snapshot) {
     }
     ids.set(tab.id, id);
   }
+  if (ids.size) await chrome.tabs.ungroup([...ids.values()]);
   for (const tab of [...snapshot.tabs].sort((a, b) => a.windowId - b.windowId || a.index - b.index)) {
     const id = ids.get(tab.id);
     await chrome.tabs.update(id, { pinned: Boolean(tab.pinned), active: false });
     await chrome.tabs.move(id, { windowId: tab.windowId, index: tab.index });
   }
-  if (ids.size) await chrome.tabs.ungroup([...ids.values()]);
   const grouped = new Map();
   for (const tab of snapshot.tabs) {
     if (tab.groupId < 0) continue;
@@ -127,9 +127,14 @@ async function restoreSnapshot(snapshot) {
   for (const tab of snapshot.tabs) {
     const actual = await chrome.tabs.get(ids.get(tab.id));
     const expectedGroup = tab.groupId < 0 ? -1 : restoredGroups.get(tab.groupId);
-    if (actual.windowId !== tab.windowId || actual.index !== tab.index || actual.url !== new URL(tab.url).href ||
-        Boolean(actual.pinned) !== Boolean(tab.pinned) || actual.groupId !== expectedGroup ||
-        Boolean(actual.active) !== Boolean(tab.active)) throw new Error("Browser state restoration failed verification");
+    const differences = [];
+    if (actual.windowId !== tab.windowId) differences.push("window");
+    if (actual.index !== tab.index) differences.push("index");
+    if (actual.url !== new URL(tab.url).href) differences.push("url");
+    if (Boolean(actual.pinned) !== Boolean(tab.pinned)) differences.push("pinned");
+    if (actual.groupId !== expectedGroup) differences.push("group");
+    if (Boolean(actual.active) !== Boolean(tab.active)) differences.push("active");
+    if (differences.length) throw new Error(`Browser state restoration failed for tab ${tab.id}: ${differences.join(", ")}`);
   }
   for (const [oldId, newId] of restoredGroups) {
     const expected = snapshot.groups[oldId];
