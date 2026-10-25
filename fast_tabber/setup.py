@@ -11,6 +11,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def register(root=ROOT):
+    directory = Path.home() / ".fast-tabber"
+    directory.mkdir(exist_ok=True)
+    private_path(directory, directory=True)
+    path = directory / "runtime.json"
+    if path.exists() and Path(json.loads(path.read_text(encoding="utf-8-sig"))["root"]).resolve() != root.resolve():
+        raise RuntimeError("Another Fast-Tabber runtime is registered; use its installer to preserve the existing Chrome pairing")
+    path.write_text(json.dumps({"root": str(root.resolve())}), encoding="utf-8")
+    private_path(path)
+
+
 def private_path(path: Path, directory=False):
     if sys.platform != "win32":
         path.chmod(0o700 if directory else 0o600)
@@ -70,7 +81,7 @@ def prepare(root: Path = ROOT):
             "options": {"baseURL": "http://127.0.0.1:11434/v1"},
             "models": {"gemma4:e2b": {
                 "name": "Gemma 4 E2B (local)",
-                "limit": {"context": 8192, "output": 1024},
+                "limit": {"context": 16384, "output": 4096},
                 "tool_call": True,
                 "attachment": True,
                 "modalities": {"input": ["text", "image"], "output": ["text"]},
@@ -79,6 +90,7 @@ def prepare(root: Path = ROOT):
         "mcp": {"fast-tabber": {
             "type": "remote", "url": "http://127.0.0.1:8765/mcp", "oauth": False,
             "headers": {"Authorization": "Bearer {env:FAST_TABBER_TOKEN}"},
+            "timeout": 600000,
         }},
         "permission": {"*": "deny", "fast-tabber_browser_status": "allow", "fast-tabber_list_tabs": "allow",
                        "fast-tabber_*": "ask", "skill": {"*": "deny", "fast-tabber": "allow"}},
@@ -97,5 +109,6 @@ def prepare(root: Path = ROOT):
 
 if __name__ == "__main__":
     result = prepare()
+    register()
     print(f"Pairing prepared for {result['origin']}. Token is stored locally and is not printed.")
     print(f"Load unpacked extension in Chrome: {ROOT / 'extension'}")

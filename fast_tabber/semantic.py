@@ -1,4 +1,4 @@
-"""Local EmbeddingGemma inference and vector operations."""
+"""Local EmbeddingGemma text/image inference and vector operations."""
 
 import json
 import math
@@ -54,7 +54,7 @@ async def embedding_digest(state: Path, client_factory=httpx.AsyncClient):
     return digest
 
 
-async def embed_texts(texts: list[str], state: Path, expected_digest: str | None = None,
+async def embed_texts(texts: list[str | dict], state: Path, expected_digest: str | None = None,
                       client_factory=httpx.AsyncClient):
     if not texts:
         return [], await embedding_digest(state, client_factory)

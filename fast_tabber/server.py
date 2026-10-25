@@ -5,11 +5,14 @@ import hmac
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
 import sqlite3
 import struct
 import threading
+import httpx
+from functools import wraps
 from typing import Annotated
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -19,32 +22,77 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from starlette.responses import JSONResponse
-from starlette.routing import WebSocketRoute
+from starlette.routing import WebSocketRoute, Route
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from fast_tabber.text import classify_pages
 from fast_tabber.text import label_clusters
+from fast_tabber.text import _gemma_digest
 from fast_tabber.semantic import cluster_vectors, cosine, embed_texts, embedding_digest
+from fast_tabber.vision import describe_image
+from fast_tabber.index import ContentIndex
+from fast_tabber.preflight import GEMMA, OLLAMA
 
 STATE = Path(__file__).resolve().parent.parent / ".state"
 
 
 class StateStore:
     def __init__(self, path: Path):
+        self.path = path.resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS collections (name TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             self.db.execute("CREATE TABLE IF NOT EXISTS undo (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ready')")
+            self.db.execute("CREATE TABLE IF NOT EXISTS catalogue_jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             self.db.execute("CREATE TABLE IF NOT EXISTS pages (tab_id INTEGER PRIMARY KEY, window_id INTEGER NOT NULL, url_hash TEXT NOT NULL, title TEXT NOT NULL, origin TEXT NOT NULL, headings TEXT NOT NULL, content TEXT NOT NULL)")
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(pages)")}
             if "embedding" not in columns:
                 self.db.execute("ALTER TABLE pages ADD COLUMN embedding BLOB")
             if "embedding_digest" not in columns:
                 self.db.execute("ALTER TABLE pages ADD COLUMN embedding_digest TEXT")
+            for column in ("url", "document_id"):
+                if column not in columns:
+                    self.db.execute(f"ALTER TABLE pages ADD COLUMN {column} TEXT")
             self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(title, origin, headings, content, tokenize='unicode61')")
             if "status" not in {row[1] for row in self.db.execute("PRAGMA table_info(undo)")}:
                 self.db.execute("ALTER TABLE undo ADD COLUMN status TEXT NOT NULL DEFAULT 'ready'")
+        self.index = ContentIndex(self.db, self.lock)
+
+    def local_data(self, scope, delete=False):
+        tables = ["pages_fts", "pages", "document_artifacts", "documents", "artifacts", "catalogue_jobs"]
+        if scope == "all":
+            tables += ["collections", "undo"]
+        backups = list(self.path.parent.glob("browser-before-*.sqlite3"))
+        with self.lock:
+            counts = {table: self.db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
+            report = {"scope": scope, "records": counts, "indexBackups": [path.name for path in backups[:20]], "backupCount": len(backups),
+                      "preservesRecoveryHistory": scope == "cache", "deleted": False}
+            if not delete:
+                return {**report, "requiresConfirmation": True}
+            self.db.execute("PRAGMA secure_delete=ON")
+            with self.db:
+                for table in tables:
+                    self.db.execute(f"DELETE FROM {table}")
+            if self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
+                raise RuntimeError("Cache rows were removed, but another database reader prevented file compaction; retry cleanup")
+            self.db.execute("VACUUM")
+            for path in backups:
+                if path.resolve().parent != self.path.parent or path.resolve() == self.path:
+                    raise RuntimeError("A backup path is outside the managed local data directory")
+                path.unlink()
+            return {**report, "deleted": True, "requiresConfirmation": False}
+
+    def save_job(self, job):
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO catalogue_jobs VALUES (?,?)", (job["id"], json.dumps(job)))
+
+    def get_job(self, job_id):
+        with self.lock:
+            row = self.db.execute("SELECT payload FROM catalogue_jobs WHERE id=?", (job_id,)).fetchone() if job_id else self.db.execute("SELECT payload FROM catalogue_jobs ORDER BY rowid DESC LIMIT 1").fetchone()
+        if row is None:
+            raise ValueError("Catalogue job not found")
+        return json.loads(row[0])
 
     def save_collection(self, name: str, payload: dict):
         try:
@@ -71,19 +119,51 @@ class StateStore:
             rows = self.db.execute("SELECT name, payload FROM collections ORDER BY name").fetchall()
         return [{"name": name, "tabCount": len(json.loads(payload)["tabs"])} for name, payload in rows]
 
-    def push_undo(self, snapshot: dict):
+    def push_undo(self, snapshot: dict, status="ready"):
         with self.lock, self.db:
-            self.db.execute("INSERT INTO undo (payload) VALUES (?)", (json.dumps(snapshot),))
-            self.db.execute("DELETE FROM undo WHERE status='ready' AND id NOT IN (SELECT id FROM undo WHERE status='ready' ORDER BY id DESC LIMIT 50)")
+            return self.db.execute("INSERT INTO undo (payload,status) VALUES (?,?)", (json.dumps(snapshot), status)).lastrowid
+
+    def finish_undo(self, entry_id, payload, status="ready"):
+        with self.lock, self.db:
+            self.db.execute("UPDATE undo SET payload=?,status=? WHERE id=?", (json.dumps(payload), status, entry_id))
+
+    def mark_undone(self, entry_id):
+        with self.lock, self.db:
+            self.db.execute("UPDATE undo SET status='undone' WHERE id=?", (entry_id,))
+
+    def remap_history(self, ids):
+        if not ids:
+            return
+        def remap(snapshot):
+            if snapshot.get("activation"):
+                previous = snapshot["activation"]["tabId"]
+                snapshot["activation"]["tabId"] = ids.get(str(previous), previous)
+            for tab in snapshot.get("tabs", []):
+                tab["id"] = ids.get(str(tab["id"]), tab["id"])
+            if snapshot.get("closeIds"):
+                snapshot["closeIds"] = [ids.get(str(tab), tab) for tab in snapshot["closeIds"]]
+        with self.lock, self.db:
+            for entry_id, payload in self.db.execute("SELECT id,payload FROM undo WHERE status!='undone'").fetchall():
+                value = json.loads(payload)
+                remap(value.get("snapshot", {}))
+                self.db.execute("UPDATE undo SET payload=? WHERE id=?", (json.dumps(value), entry_id))
+            for name, payload in self.db.execute("SELECT name,payload FROM collections").fetchall():
+                value = json.loads(payload)
+                remap(value)
+                self.db.execute("UPDATE collections SET payload=? WHERE name=?", (json.dumps(value), name))
+            for old, new in ids.items():
+                if int(old) != new:
+                    self.db.execute("UPDATE pages SET tab_id=? WHERE tab_id=?", (new, int(old)))
+                    self.db.execute("UPDATE pages_fts SET rowid=? WHERE rowid=?", (new, int(old)))
 
     def latest_undo(self):
         with self.lock:
-            row = self.db.execute("SELECT id, payload, status FROM undo ORDER BY id DESC LIMIT 1").fetchone()
+            row = self.db.execute("SELECT id, payload, status FROM undo WHERE status!='undone' ORDER BY id DESC LIMIT 1").fetchone()
         return (row[0], json.loads(row[1]), row[2]) if row else None
 
     def claim_undo(self, entry_id: int):
         with self.lock, self.db:
-            return self.db.execute("UPDATE undo SET status='applying' WHERE id=? AND status='ready'", (entry_id,)).rowcount == 1
+            return self.db.execute("UPDATE undo SET status='applying' WHERE id=? AND status IN ('ready','failed','executing')", (entry_id,)).rowcount == 1
 
     def reset_undo(self, entry_id: int):
         with self.lock, self.db:
@@ -104,7 +184,7 @@ class StateStore:
                 tab_id = page["id"]
                 self.db.execute("DELETE FROM pages_fts WHERE rowid=?", (tab_id,))
                 parsed = urlsplit(page["url"])
-                content = page["text"][:3000]
+                content = page["text"]
                 headings = " ".join(page["headings"])
                 host = f"[{parsed.hostname}]" if ":" in (parsed.hostname or "") else parsed.hostname
                 origin = f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port else "")
@@ -196,19 +276,25 @@ class StateStore:
 class Bridge:
     def __init__(self):
         self.peer: WebSocket | None = None
+        self.extension_version = None
         self.pending: dict[str, asyncio.Future] = {}
         self.lock = asyncio.Lock()
 
     async def call(self, operation: str, arguments: dict | None = None, timeout: float = 15):
         if operation not in {"probe", "list_tabs", "tab_action", "group_action", "move_tabs", "close_tabs",
                              "close_saved_collection", "restore_snapshot", "capture_tabs", "find_duplicates",
-                             "restore_collection", "extract_tabs", "filter_tabs", "group_categories"}:
+                             "restore_collection", "extract_tabs", "filter_tabs", "group_categories", "capture_page", "capture_browser", "reload_extension"}:
             raise ValueError("Browser operation is not enabled")
         if operation == "extract_tabs":
             timeout = max(timeout, 180)
+        if operation == "capture_page":
+            timeout = max(timeout, 60)
+        if operation in {"capture_browser", "restore_snapshot"}:
+            timeout = max(timeout, 180)
         async with self.lock:
             if self.peer is None:
-                raise RuntimeError("Chrome extension is disconnected. Load/reload extension/ in Chrome.")
+                raise RuntimeError(f"Chrome extension is disconnected. Ask the user to open chrome://extensions, enable Developer mode, "
+                                   f"load unpacked {STATE.parent / 'extension'}, and approve its permissions. Chrome requires this user step.")
             request_id = secrets.token_hex(12)
             future = asyncio.get_running_loop().create_future()
             self.pending[request_id] = future
@@ -232,6 +318,7 @@ class Bridge:
                 await socket.close(code=1008)
                 return
             self.peer = socket
+            self.extension_version = auth.get("version") if isinstance(auth.get("version"), str) else None
             await socket.send_json({"type": "paired"})
             while True:
                 message = await socket.receive_json()
@@ -252,6 +339,7 @@ class Bridge:
         finally:
             if self.peer is socket:
                 self.peer = None
+                self.extension_version = None
                 for future in self.pending.values():
                     if not future.done():
                         future.set_exception(RuntimeError("Chrome disconnected; operation outcome unknown"))
@@ -283,25 +371,52 @@ def create_app(token: str, origin: str, database: Path | None = None):
     operation_lock = asyncio.Lock()
     index_lock = asyncio.Lock()
     inference_lock = asyncio.Lock()
-    mcp = MCPServer("fast-tabber", version="0.4.0", instructions="Manage, search, and organize Chrome tabs with local Gemma and semantic embeddings.")
+    processing_lock = asyncio.Lock()
+    catalogue_control_lock = asyncio.Lock()
+    catalogue_tasks = {}
+    def serialized(lock):
+        def decorate(function):
+            @wraps(function)
+            async def run(*args, **kwargs):
+                async with lock:
+                    return await function(*args, **kwargs)
+            return run
+        return decorate
+    serialized_processing = serialized(processing_lock)
+    serialized_catalogue = serialized(catalogue_control_lock)
+    mcp = MCPServer("fast-tabber", version="0.5.0", instructions="Manage, search, and organize Chrome tabs with local Gemma text, vision, and semantic embeddings.")
 
     async def mutate(operation: str, arguments: dict, collection_name: str | None = None):
         async with operation_lock:
-            result = await bridge.call(operation, arguments)
+            latest = store.latest_undo()
+            if latest and latest[2] in {"executing", "failed", "applying"}:
+                raise RuntimeError("A previous mutation needs recovery; use undo_last before further changes")
+            baseline = await bridge.call("capture_browser")
+            provisional = {"operation": operation, "snapshot": baseline, "collection": collection_name,
+                           "intent": arguments, "provisional": True}
+            entry_id = store.push_undo(provisional, "executing")
+            try:
+                result = await bridge.call(operation, arguments)
+            except Exception as error:
+                provisional["error"] = str(error)
+                store.finish_undo(entry_id, provisional, "failed")
+                raise
             before = result.pop("before", None)
             close_ids = result.pop("closeIds", None)
-            if close_ids or (before and (before.get("tabs") or before.get("closeIds"))):
+            if close_ids or (before and (before.get("tabs") or before.get("closeIds") or before.get("activation"))):
                 snapshot = before or {"tabs": [], "groups": {}}
                 if close_ids:
                     snapshot["closeIds"] = close_ids
                 try:
-                    store.push_undo({"operation": operation, "snapshot": snapshot, "collection": collection_name})
+                    store.finish_undo(entry_id, {"operation": operation, "snapshot": snapshot, "collection": collection_name})
                 except sqlite3.Error as error:
                     try:
                         await bridge.call("restore_snapshot", snapshot)
                     except Exception as rollback_error:
                         raise RuntimeError(f"Undo history could not be saved ({error}); browser rollback incomplete ({rollback_error})") from error
                     raise RuntimeError(f"Undo history could not be saved; browser change rolled back ({error})") from error
+            else:
+                store.mark_undone(entry_id)
             return result
 
     async def index_pages(pages: list[dict]):
@@ -310,14 +425,72 @@ def create_app(token: str, origin: str, database: Path | None = None):
         async with index_lock:
             digest = await embedding_digest(STATE)
             store.save_pages(pages, digest)
-            pending = store.pending_embeddings(digest)
-            if pending:
+            documents = {page["id"]: store.index.document(page) for page in pages}
+            keys = {tab: store.index.artifacts(document[0]) for tab, document in documents.items()}
+            pending = store.index.pending([key for artifacts in keys.values() for key in artifacts], digest)
+            for offset in range(0, len(pending), 16):
+                batch = pending[offset:offset + 16]
                 async with inference_lock:
-                    vectors, actual_digest = await embed_texts([page["text"] for page in pending], STATE, digest)
+                    vectors, actual_digest = await embed_texts([item[1] for item in batch], STATE, digest)
                 if actual_digest != digest:
                     raise RuntimeError("EmbeddingGemma changed during indexing; run tabber.ps1 check")
-                store.save_embeddings(pending, vectors, digest)
-            return len(pending), digest
+                store.index.save_vectors([item[0] for item in batch], vectors, digest)
+            page_vectors = [store.index.page_vector(keys[page["id"]], digest) for page in pages]
+            rows = [{"id": page["id"], "digest": store.db.execute("SELECT url_hash FROM pages WHERE tab_id=?", (page["id"],)).fetchone()[0]} for page in pages]
+            store.save_embeddings(rows, page_vectors, digest)
+            with store.lock, store.db:
+                for tab, (document, url) in documents.items():
+                    store.db.execute("UPDATE pages SET document_id=?,url=? WHERE tab_id=?", (document, url, tab))
+            computed = {item[0] for item in pending}
+            return sum(any(key in computed for key in artifacts) for artifacts in keys.values()), digest
+
+    async def add_visual_evidence(extracted: dict):
+        async with httpx.AsyncClient(base_url=OLLAMA, timeout=180, trust_env=False) as client:
+            vision_model = await _gemma_digest(client, STATE) + ":subject-v2"
+        pages = {page["id"]: page for page in extracted["items"]}
+        empty = [failure["id"] for failure in extracted["failures"] if failure["reason"] in {"no_rendered_text", "discarded_tab_not_woken"}]
+        for tab_id in [*pages, *empty]:
+            async with operation_lock:
+                capture = await bridge.call("capture_page", {"tabId": tab_id})
+            page = pages.get(tab_id, {"id": tab_id, "windowId": capture["windowId"], "url": capture["url"],
+                                      "title": capture["title"], "headings": [], "text": ""})
+            if page["url"] != capture["url"]:
+                raise RuntimeError("A page navigated between text and visual capture; no tabs were grouped")
+            page.update({"title": capture["title"], "headings": capture["headings"], "text": capture["text"]})
+            store.index.document(page)
+            image = capture.pop("image")
+            image_id = store.index.image(image)
+            description = store.index.description(image_id, vision_model)
+            if description is None:
+                async with inference_lock:
+                    description = await describe_image(image, STATE)
+                store.index.save_description(image_id, vision_model, description)
+            pages[tab_id] = {**page, "text": page["text"] + "\nVisual evidence: " + description,
+                            "visual": True, "image_id": image_id}
+        return {"items": list(pages.values()), "failures": [failure for failure in extracted["failures"]
+                                                            if failure["reason"] not in {"no_rendered_text", "discarded_tab_not_woken"}]}
+
+    async def reuse_sleeping_pages(extracted):
+        sleeping = [item["id"] for item in extracted["failures"] if item["reason"] == "discarded_tab_not_woken"]
+        if not sleeping:
+            return extracted
+        metadata = await bridge.call("capture_tabs", {"tabIds": sleeping})
+        cached = [page for item in metadata["tabs"] if (page := store.index.cached_page(item)) is not None]
+        found = {page["id"] for page in cached}
+        return {"items": extracted["items"] + cached,
+                "failures": [item for item in extracted["failures"] if item["id"] not in found]}
+
+    async def cached_selection(tab_ids, window_id, require_visual=False):
+        metadata = await bridge.call("capture_tabs", {"tabIds": tab_ids}) if tab_ids else await bridge.call("capture_browser")
+        selected = [tab for tab in metadata["tabs"] if tab["url"].startswith(("http://", "https://")) and
+                    (window_id is None or tab["windowId"] == window_id)]
+        pages = []
+        for tab in selected:
+            page = store.index.cached_page(tab)
+            if page is None or require_visual and not page["visual"]:
+                raise RuntimeError("Some selected tabs have no complete local index. Start/resume catalogue_tabs, then organize with use_index=true.")
+            pages.append(page)
+        return {"items": pages, "failures": []}
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
     async def browser_status() -> dict:
@@ -326,6 +499,24 @@ def create_app(token: str, origin: str, database: Path | None = None):
             return await bridge.call("probe")
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+    async def browser_setup(action: str = "reload_extension") -> dict:
+        """Reload the already paired Chrome extension after a local toolkit update; requires no Computer Use."""
+        if action != "reload_extension":
+            raise ToolError("action must be reload_extension")
+        async with operation_lock:
+            await bridge.call("reload_extension")
+            for _ in range(30):
+                await asyncio.sleep(1)
+                try:
+                    status = await bridge.call("probe", timeout=2)
+                    expected = json.loads((STATE.parent / "extension" / "manifest.json").read_text())["version"]
+                    if status["extensionVersion"] == expected:
+                        return {"reloaded": True, "extensionVersion": expected, "verified": True}
+                except RuntimeError:
+                    pass
+            raise ToolError("Extension reload did not reconnect with the installed version; inspect Chrome permissions")
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
     async def list_tabs(window_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0,
@@ -432,21 +623,29 @@ def create_app(token: str, origin: str, database: Path | None = None):
             raise ToolError(str(error)) from error
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
-    async def index_tabs(tab_ids: list[int] | None = None, window_id: int | None = None) -> dict:
-        """Extract rendered page text locally and refresh the local search index; returns counts only."""
+    @serialized_processing
+    async def index_tabs(tab_ids: list[int] | None = None, window_id: int | None = None, visual: bool = False) -> dict:
+        """Refresh local text/semantic index; visual=True adds native screenshots interpreted by local Gemma. Returns counts only."""
         try:
+            if visual and (not tab_ids or len(tab_ids) > 20):
+                raise ValueError("Use catalogue_tabs for automatic whole-browser visual indexing; it checkpoints each page and limits memory use.")
             if tab_ids is not None and (not tab_ids or len(tab_ids) > 500 or len(set(tab_ids)) != len(tab_ids)):
                 raise ValueError("tab_ids must be unique and contain at most 500 IDs")
             if tab_ids is not None and window_id is not None:
                 raise ValueError("choose tab_ids or window_id")
             result = await bridge.call("extract_tabs", {"tabIds": tab_ids, "windowId": window_id})
+            if visual:
+                result = await add_visual_evidence(result)
+            else:
+                result = await reuse_sleeping_pages(result)
             embedded, _ = await index_pages(result["items"])
-            return {"indexed": len(result["items"]), "embedded": embedded, "skipped": len(result["failures"]),
+            return {"indexed": len(result["items"]), "embedded": embedded, "visual": len(result["items"]) if visual else 0, "skipped": len(result["failures"]),
                     "failures": result["failures"][:20]}
         except (RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
             raise ToolError(str(error)) from error
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+    @serialized_processing
     async def search_tabs(query: str, mode: str = "keyword", offset: Annotated[int, Field(ge=0)] = 0,
                           limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict:
         """Search local page text by keywords or EmbeddingGemma semantic similarity."""
@@ -475,18 +674,27 @@ def create_app(token: str, origin: str, database: Path | None = None):
             raise ToolError(str(error)) from error
 
     @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
+    @serialized_processing
     async def organize_by_text(instruction: str, tab_ids: list[int] | None = None,
                                window_id: int | None = None, categories: list[str] | None = None,
-                               mode: str = "batch") -> dict:
-        """Classify extracted page content with local Gemma, then natively group verified matches."""
+                               mode: str = "batch", visual: bool = False, use_index: bool = False) -> dict:
+        """Group text/semantic content; visual=True adds local Gemma screenshot interpretation before grouping."""
         try:
+            if visual and not use_index and (not tab_ids or len(tab_ids) > 20):
+                raise ValueError("Start catalogue_tabs, wait for completion, then organize with use_index=true and visual=true.")
             if mode not in {"batch", "sequential"}:
                 raise ValueError("mode must be batch or sequential")
+            if not instruction.strip() or len(instruction) > 1000:
+                raise ValueError("instruction must contain 1 to 1000 characters")
             if tab_ids is not None and (not tab_ids or len(tab_ids) > 500 or len(set(tab_ids)) != len(tab_ids)):
                 raise ValueError("tab_ids must be unique and contain at most 500 IDs")
             if tab_ids is not None and window_id is not None:
                 raise ValueError("choose tab_ids or window_id")
-            extracted = await bridge.call("extract_tabs", {"tabIds": tab_ids, "windowId": window_id})
+            extracted = await cached_selection(tab_ids, window_id, visual) if use_index else await bridge.call("extract_tabs", {"tabIds": tab_ids, "windowId": window_id})
+            if visual and not use_index:
+                extracted = await add_visual_evidence(extracted)
+            elif not use_index:
+                extracted = await reuse_sleeping_pages(extracted)
             pages = extracted["items"]
             if not pages:
                 raise ValueError(f"No readable page text; failed tabs: {json.dumps(extracted['failures'][:20])}")
@@ -506,10 +714,16 @@ def create_app(token: str, origin: str, database: Path | None = None):
                 for page, cluster_id in zip(pages, cluster_ids):
                     if cluster_id >= 0:
                         clusters.setdefault(cluster_id, []).append(page)
-                async with inference_lock:
-                    names = await label_clusters(clusters, instruction, STATE) if clusters else {}
-                labels = {page["id"]: names.get(cluster_id, "Uncategorized")
-                          for page, cluster_id in zip(pages, cluster_ids)}
+                if visual:
+                    ordered = [page for members in clusters.values() for page in members]
+                    ordered.extend(page for page, cluster_id in zip(pages, cluster_ids) if cluster_id < 0)
+                    async with inference_lock:
+                        labels = await classify_pages(ordered, instruction, None, STATE)
+                else:
+                    async with inference_lock:
+                        names = await label_clusters(clusters, instruction, STATE) if clusters else {}
+                    labels = {page["id"]: names.get(cluster_id, "Uncategorized")
+                              for page, cluster_id in zip(pages, cluster_ids)}
             grouped = {}
             for tab_id, label in labels.items():
                 if label != "Uncategorized":
@@ -526,19 +740,152 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except (RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
             raise ToolError(str(error)) from error
 
+    async def run_catalogue(job_id):
+        try:
+            job = store.get_job(job_id)
+            for position, item in enumerate(job["items"]):
+                job = store.get_job(job_id)
+                if job["state"] == "cancel_requested":
+                    job["state"] = "cancelled"
+                    store.save_job(job)
+                    return
+                if item.get("done"):
+                    continue
+                current = (await bridge.call("capture_tabs", {"tabIds": [item["id"]]}))["tabs"][0]
+                if current["url"] != item["url"]:
+                    raise RuntimeError("A pending tab navigated; resume or start a new catalogue before continuing")
+                result = await index_tabs(tab_ids=[item["id"]], visual=True)
+                if result["skipped"]:
+                    raise RuntimeError(f"Tab {item['id']} could not be indexed: {result['failures']}")
+                job = store.get_job(job_id)
+                job["items"][position]["done"] = True
+                store.save_job(job)
+                await asyncio.sleep(0)
+            job = store.get_job(job_id)
+            job["state"] = "complete"
+            store.save_job(job)
+        except Exception as error:
+            job = store.get_job(job_id)
+            job.update(state="failed", error=str(error)[:500])
+            store.save_job(job)
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, open_world_hint=False))
+    @serialized_catalogue
+    async def catalogue_tabs(action: str = "start", job_id: str = "", tab_ids: list[int] | None = None,
+                             wait_seconds: Annotated[int, Field(ge=0, le=30)] = 20) -> dict:
+        """Automatically catalogue all tabs, including sleeping tabs, one page at a time. Checkpointed start/status/resume/cancel jobs."""
+        try:
+            if action not in {"start", "status", "resume", "cancel"}:
+                raise ValueError("Choose start, status, resume, or cancel")
+            if action == "start":
+                if any(not task.done() for task in catalogue_tasks.values()):
+                    raise ValueError("A catalogue is already running; inspect or cancel its job before starting another")
+                metadata = await bridge.call("capture_tabs", {"tabIds": tab_ids}) if tab_ids else await bridge.call("capture_browser")
+                items = []
+                for tab in metadata["tabs"]:
+                    if tab["url"].startswith(("http://", "https://")):
+                        cached = store.index.cached_page(tab)
+                        items.append({"id": tab["id"], "url": tab["url"], "done": bool(cached and cached["visual"])})
+                if not items or len(items) > 500:
+                    raise ValueError("Catalogue requires 1 to 500 ordinary web tabs")
+                await embedding_digest(STATE)
+                async with httpx.AsyncClient(base_url=OLLAMA, timeout=180, trust_env=False) as client:
+                    await _gemma_digest(client, STATE)
+                job = {"id": secrets.token_hex(8), "state": "running", "items": items}
+                store.save_job(job)
+                catalogue_tasks[job["id"]] = asyncio.create_task(run_catalogue(job["id"]))
+            else:
+                job = store.get_job(job_id)
+                job_id = job["id"]
+                active = job_id in catalogue_tasks and not catalogue_tasks[job_id].done()
+                if action == "status" and active:
+                    for _ in range(wait_seconds * 2):
+                        await asyncio.sleep(0.5)
+                        if catalogue_tasks[job_id].done():
+                            break
+                    job = store.get_job(job_id)
+                    active = not catalogue_tasks[job_id].done()
+                if action == "cancel":
+                    job["state"] = "cancel_requested" if active else "cancelled"
+                    store.save_job(job)
+                elif action == "resume":
+                    if active or any(not task.done() for task in catalogue_tasks.values()):
+                        raise ValueError("A catalogue is already running")
+                    current = (await bridge.call("capture_browser"))["tabs"]
+                    for item in job["items"]:
+                        if item["done"]:
+                            continue
+                        matches = [tab for tab in current if tab["id"] == item["id"] and tab["url"] == item["url"]]
+                        matches = matches or [tab for tab in current if tab["url"] == item["url"]]
+                        if len(matches) != 1:
+                            raise ValueError("A pending tab is missing or ambiguous; select the current tabs for a new catalogue")
+                        item["id"] = matches[0]["id"]
+                    job.update(state="running", error=None)
+                    store.save_job(job)
+                    catalogue_tasks[job_id] = asyncio.create_task(run_catalogue(job_id))
+                elif not active and job["state"] in {"running", "cancel_requested"}:
+                    job["state"] = "interrupted"
+                    store.save_job(job)
+            return {"jobId": job["id"], "state": job["state"], "completed": sum(item["done"] for item in job["items"]),
+                    "total": len(job["items"]), "error": job.get("error")}
+        except (RuntimeError, ValueError, KeyError, OSError, sqlite3.Error) as error:
+            raise ToolError(str(error)) from error
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True, open_world_hint=False))
+    async def local_data(action: str = "preview", scope: str = "cache", confirm: bool = False) -> dict:
+        """Preview/delete local cache or all saved browser data. Ask the user to confirm the preview before confirm=true."""
+        if action not in {"preview", "delete"} or scope not in {"cache", "all"}:
+            raise ToolError("Choose preview/delete and cache/all. All also removes collections and undo history.")
+        if action == "delete" and confirm and any(not task.done() for task in catalogue_tasks.values()):
+            raise ToolError("Cancel the running catalogue and wait for it to stop before deleting local data")
+        async with processing_lock, operation_lock:
+            try:
+                return store.local_data(scope, action == "delete" and confirm)
+            except (OSError, RuntimeError, sqlite3.Error) as error:
+                raise ToolError(str(error)) from error
+
     @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
-    async def undo_last() -> dict:
-        """Undo the most recent tab mutation or restore a closed tab collection."""
+    async def undo_last(all_changes: bool = False) -> dict:
+        """Revert the latest toolkit mutation, or all retained toolkit changes in reverse order. Keeps the local index."""
         async with operation_lock:
+            completed = []
+            restored = 0
+            tab_ids = []
+            while True:
+                try:
+                    result = await restore_one()
+                except (RuntimeError, ValueError, sqlite3.Error, ToolError) as error:
+                    raise ToolError(f"Revert stopped after {len(completed)} verified changes: {error}") from error
+                completed.append(result["undone"])
+                restored += result["restored"]
+                tab_ids.extend(result["tabIds"])
+                if not all_changes or store.latest_undo() is None:
+                    return {"undone": result["undone"] if not all_changes else "all", "changes": len(completed),
+                            "restored": restored, "tabIds": tab_ids[-20:], "verified": True}
+
+    async def restore_one():
             entry = store.latest_undo()
             if entry is None:
                 raise ToolError("No verified browser action is available to undo")
             entry_id, value, status = entry
-            if status != "ready":
+            if status == "applying":
                 raise ToolError("The previous undo outcome is uncertain; inspect Chrome before making another change")
             if not store.claim_undo(entry_id):
                 raise ToolError("This undo is already being applied; inspect Chrome before retrying")
             try:
+                if value.get("provisional"):
+                    current = await bridge.call("capture_browser")
+                    original = {tab["id"] for tab in value["snapshot"]["tabs"]}
+                    intent = value["intent"]
+                    expected = []
+                    if value["operation"] == "tab_action" and intent.get("action") == "open":
+                        expected = [intent["url"]]
+                    if value["operation"] == "restore_collection":
+                        expected = [tab["url"] for tab in intent["collection"]["tabs"]]
+                    created = [tab for tab in current["tabs"] if tab["id"] not in original and tab["url"] in expected]
+                    if any(sum(tab["url"] == url for tab in created) > expected.count(url) for url in expected):
+                        raise RuntimeError("New tabs cannot be identified unambiguously; reconcile them before recovery")
+                    value["snapshot"]["closeIds"] = [tab["id"] for tab in created]
                 result = await bridge.call("restore_snapshot", value["snapshot"])
                 if value.get("collection"):
                     collection = store.get_collection(value["collection"])
@@ -548,7 +895,8 @@ def create_app(token: str, origin: str, database: Path | None = None):
                             if str(tab["id"]) in restored_ids:
                                 tab["id"] = restored_ids[str(tab["id"])]
                         store.update_collection(value["collection"], collection)
-                store.remove_undo(entry_id)
+                store.remap_history(result.get("ids", {}))
+                store.mark_undone(entry_id)
                 return {"undone": value["operation"], "restored": result.get("restored", 0),
                         "tabIds": list(result.get("ids", {}).values())[:20], "verified": True}
             except (RuntimeError, ValueError, sqlite3.Error) as error:
@@ -563,7 +911,32 @@ def create_app(token: str, origin: str, database: Path | None = None):
     async def extension(socket):
         await bridge.connect(socket, token, origin)
 
+    async def health(request):
+        return JSONResponse({"name": "fast-tabber", "version": "0.5.0", "root": str(STATE.parent),
+            "connected": bridge.peer is not None, "extensionVersion": bridge.extension_version, "pid": os.getpid(),
+            "busy": operation_lock.locked() or processing_lock.locked() or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values())})
+
+    async def shutdown(request):
+        if operation_lock.locked() or processing_lock.locked() or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values()):
+            return JSONResponse({"error": "The toolkit is busy; finish the current operation before restarting"}, status_code=409)
+        runner = getattr(app.state, "server", None)
+        if runner is None:
+            return JSONResponse({"error": "This service cannot manage its own lifecycle"}, status_code=409)
+        runner.should_exit = True
+        return JSONResponse({"stopping": True})
+
+    async def reload_extension(request):
+        if operation_lock.locked() or processing_lock.locked() or any(not task.done() for task in catalogue_tasks.values()):
+            return JSONResponse({"error": "Finish/cancel the current operation before updating the extension"}, status_code=409)
+        try:
+            async with operation_lock:
+                return JSONResponse(await bridge.call("reload_extension"))
+        except RuntimeError as error:
+            return JSONResponse({"error": str(error)}, status_code=409)
+
     app.router.routes.append(WebSocketRoute("/extension", extension))
+    app.router.routes.extend([Route("/health", health), Route("/shutdown", shutdown, methods=["POST"]),
+                              Route("/reload-extension", reload_extension, methods=["POST"])])
     app.state.bridge = bridge
     app.state.store = store
     app.add_middleware(LocalAuthentication, token=token)
@@ -577,7 +950,10 @@ def main():
     if not path.exists():
         raise SystemExit("Run python -m fast_tabber.setup first")
     connection = json.loads(path.read_text(encoding="utf-8"))
-    uvicorn.run(create_app(connection["token"], connection["origin"]), host="127.0.0.1", port=8765, ws_max_size=8 * 1024 * 1024)
+    app = create_app(connection["token"], connection["origin"])
+    runner = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8765, ws_max_size=8 * 1024 * 1024))
+    app.state.server = runner
+    runner.run()
 
 
 if __name__ == "__main__":

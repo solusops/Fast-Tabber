@@ -2,8 +2,10 @@ import asyncio
 from pathlib import Path
 
 import pytest
+import httpx
+import json
 
-from fast_tabber.text import _response_content, classify_pages, validate_assignments, validate_cluster_labels
+from fast_tabber.text import _response_content, classify_pages, validate_assignments, validate_cluster_labels, structured_batches
 
 
 PAGES = [{"id": 1}, {"id": 2}]
@@ -43,3 +45,20 @@ def test_truncated_gemma_output_is_not_accepted():
 
     with pytest.raises(RuntimeError, match="truncated or empty"):
         _response_content(Response(), "cluster labeling")
+
+
+@pytest.mark.asyncio
+async def test_structured_harness_splits_truncation_without_changing_model():
+    seen = []
+    def handler(request):
+        body = json.loads(request.content)
+        batch = json.loads(body["messages"][0]["content"])
+        seen.append(batch)
+        assert body["think"] is True and body["model"] == "gemma4:e2b"
+        assert body["options"]["num_predict"] >= 4096
+        if len(batch) > 1:
+            return httpx.Response(200, json={"done_reason": "length", "message": {"content": ""}})
+        return httpx.Response(200, json={"done_reason": "stop", "message": {"content": json.dumps({str(batch[0]): "ok"})}})
+    async with httpx.AsyncClient(base_url="http://127.0.0.1:11434", transport=httpx.MockTransport(handler)) as client:
+        result = await structured_batches(client, [1, 2], json.dumps, lambda _: {}, lambda payload, _: payload, "test")
+    assert result == {"1": "ok", "2": "ok"} and seen == [[1, 2], [1], [2]]

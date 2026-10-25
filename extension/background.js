@@ -1,24 +1,30 @@
 // Chrome 116+ keeps an extension worker alive while its WebSocket exchanges messages.
 let socket;
 let heartbeat;
+let connecting = false;
+let captureStatus = { stage: "idle" };
 
 async function probe() {
   const permissions = await chrome.permissions.getAll();
   if (!permissions.permissions.includes("tabs") || !permissions.permissions.includes("tabGroups") ||
-      !permissions.permissions.includes("scripting") || !permissions.origins.some(origin => origin === "http://*/*") ||
-      !permissions.origins.some(origin => origin === "https://*/*"))
+      !permissions.permissions.includes("scripting") || !(permissions.origins.includes("<all_urls>") ||
+      permissions.origins.includes("http://*/*") && permissions.origins.includes("https://*/*")))
     throw new Error("Chrome tabs, tabGroups, scripting, and ordinary-site access are required");
   const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
   const tabs = await chrome.tabs.query({ windowType: "normal" });
   return {
     connected: true,
     windowCount: windows.filter(window => !window.incognito).length,
+    windows: windows.filter(window => !window.incognito).slice(0, 20).map(window => ({ id: window.id, state: window.state, focused: window.focused })),
     tabCount: tabs.filter(tab => !tab.incognito).length,
     permissions: permissions.permissions,
     extensionVersion: chrome.runtime.getManifest().version,
-    stage: "v4",
+    stage: "v5",
+    visualCapture: permissions.permissions.includes("debugger"),
+    captureBackend: "chrome.debugger/Page.captureScreenshot",
+    captureStatus,
     operations: ["list_tabs", "tab_action", "group_action", "move_tabs", "collection_action",
-      "close_tabs", "find_duplicates", "restore_snapshot", "undo_last", "extract_tabs", "filter_tabs", "group_categories"],
+      "close_tabs", "find_duplicates", "restore_snapshot", "undo_last", "extract_tabs", "filter_tabs", "group_categories", "capture_page", "capture_browser", "reload_extension"],
   };
 }
 
@@ -66,7 +72,7 @@ async function captureTabs(tabIds) {
   for (const id of [...new Set(tabIds)]) {
     const tab = await chrome.tabs.get(id);
     if (tab.incognito || !tab.url) throw new Error("Incognito or inaccessible tabs cannot be saved or changed");
-    tabs.push({ id, windowId: tab.windowId, index: tab.index, url: tab.url, active: tab.active,
+    tabs.push({ id, windowId: tab.windowId, index: tab.index, url: tab.url, title: (tab.title || "").slice(0, 200), discarded: Boolean(tab.discarded), active: tab.active,
       pinned: tab.pinned, groupId: tab.groupId });
     if (tab.groupId >= 0 && !groups[tab.groupId]) {
       const group = await chrome.tabGroups.get(tab.groupId);
@@ -77,6 +83,13 @@ async function captureTabs(tabIds) {
 }
 
 async function restoreSnapshot(snapshot) {
+  if (snapshot.activation) {
+    const tab = await chrome.tabs.get(snapshot.activation.tabId);
+    if (tab.incognito) throw new Error("Incognito tabs cannot be restored");
+    await chrome.tabs.update(tab.id, { active: true });
+    if (!(await chrome.tabs.get(tab.id)).active) throw new Error("Previous active tab was not restored");
+    return { restored: 1, ids: {} };
+  }
   const ids = new Map();
   const restoredGroups = new Map();
   for (const windowId of new Set(snapshot.tabs.map(tab => tab.windowId))) {
@@ -98,13 +111,18 @@ async function restoreSnapshot(snapshot) {
     ids.set(tab.id, id);
   }
   if (ids.size) await chrome.tabs.ungroup([...ids.values()]);
-  for (const tab of [...snapshot.tabs].sort((a, b) => a.windowId - b.windowId || a.index - b.index)) {
+  const ordered = [...snapshot.tabs].sort((a, b) => a.windowId - b.windowId || a.index - b.index);
+  // Park selected tabs at the end first so restoring sparse positions cannot shift an earlier restored tab.
+  for (const tab of ordered) {
     const id = ids.get(tab.id);
     await chrome.tabs.update(id, { pinned: Boolean(tab.pinned), active: false });
-    await chrome.tabs.move(id, { windowId: tab.windowId, index: tab.index });
+    const actual = await chrome.tabs.get(id);
+    const pinned = tab.pinned ? (await chrome.tabs.query({ windowId: tab.windowId, pinned: true })).length : 0;
+    await chrome.tabs.move(id, { windowId: tab.windowId, index: tab.pinned ? pinned - (actual.windowId === tab.windowId ? 1 : 0) : -1 });
   }
+  for (const tab of ordered) await chrome.tabs.move(ids.get(tab.id), { windowId: tab.windowId, index: tab.index });
   const grouped = new Map();
-  for (const tab of snapshot.tabs) {
+  for (const tab of ordered) {
     if (tab.groupId < 0) continue;
     const key = `${tab.windowId}:${tab.groupId}`;
     if (!grouped.has(key)) grouped.set(key, { oldId: tab.groupId, windowId: tab.windowId, tabs: [] });
@@ -124,6 +142,9 @@ async function restoreSnapshot(snapshot) {
     restoredGroups.set(item.oldId, groupId);
   }
   for (const active of snapshot.tabs.filter(tab => tab.active)) await chrome.tabs.update(ids.get(active.id), { active: true });
+  for (const tab of snapshot.tabs.filter(tab => tab.discarded)) {
+    if (!(await chrome.tabs.get(ids.get(tab.id))).discarded) await chrome.tabs.discard(ids.get(tab.id));
+  }
   for (const tab of snapshot.tabs) {
     const actual = await chrome.tabs.get(ids.get(tab.id));
     const expectedGroup = tab.groupId < 0 ? -1 : restoredGroups.get(tab.groupId);
@@ -134,6 +155,7 @@ async function restoreSnapshot(snapshot) {
     if (Boolean(actual.pinned) !== Boolean(tab.pinned)) differences.push("pinned");
     if (actual.groupId !== expectedGroup) differences.push("group");
     if (Boolean(actual.active) !== Boolean(tab.active)) differences.push("active");
+    if (tab.discarded && !actual.discarded) differences.push("discarded");
     if (differences.length) throw new Error(`Browser state restoration failed for tab ${tab.id}: ${differences.join(", ")}`);
   }
   for (const [oldId, newId] of restoredGroups) {
@@ -354,6 +376,10 @@ async function extractTabs({ tabIds, windowId }) {
   };
   for (let offset = 0; offset < normal.length; offset += 8) {
     await Promise.all(normal.slice(offset, offset + 8).map(async tab => {
+      if (tab.discarded) {
+        failures.push({ id: tab.id, reason: "discarded_tab_not_woken" });
+        return;
+      }
       if (!/^https?:\/\//i.test(tab.url || "")) {
         failures.push({ id: tab.id, reason: "unsupported_url" });
         return;
@@ -385,6 +411,110 @@ async function filterTabs({ tabIds }) {
     if (tab && !tab.incognito && /^https?:\/\//i.test(tab.url || "")) existing.push(id);
   }
   return { tabIds: existing };
+}
+
+async function capturePage({ tabId }) {
+  if (!await chrome.permissions.contains({ permissions: ["debugger"] }))
+    throw new Error("Native screenshots require Chrome debugger permission; reload/approve Fast-Tabber V5");
+  const tab = await chrome.tabs.get(tabId);
+  if (tab.incognito || !/^https?:\/\//i.test(tab.url || "") || new URL(tab.url).username || new URL(tab.url).password)
+    throw new Error("Only ordinary HTTP/HTTPS pages without embedded credentials can be captured");
+  const target = { tabId };
+  const previous = (await chrome.tabs.query({ active: true, windowId: tab.windowId }))[0];
+  const captureWindow = await chrome.windows.get(tab.windowId);
+  let prepared = false;
+  let attached = false;
+  let image;
+  let pageText;
+  const command = async (method, params) => {
+    captureStatus = { stage: method, tabId };
+    let timer;
+    try {
+      return await Promise.race([chrome.debugger.sendCommand(target, method, params),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Chrome ${method} timed out`)), 15000); })]);
+    } finally { clearTimeout(timer); }
+  };
+  try {
+    captureStatus = { stage: "activate", tabId };
+    if (captureWindow.state === "minimized") await chrome.windows.update(tab.windowId, { state: "normal" });
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+    await waitForLoad(tabId);
+    captureStatus = { stage: "attach", tabId };
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    await command("Page.bringToFront");
+    captureStatus = { stage: "mask", tabId };
+    prepared = true;
+    await chrome.scripting.executeScript({ target: { tabId }, func: () => {
+      if (globalThis.__fastTabberCapture) throw new Error("Screenshot capture is already active");
+      const state = { hidden: [] };
+      const style = document.createElement("style");
+      style.textContent = "form,input,textarea,select,[contenteditable],iframe,object,embed { visibility:hidden !important; }";
+      state.style = style;
+      const maskShadowHosts = () => {
+        for (const node of document.querySelectorAll("*")) if (node.shadowRoot && !state.hidden.some(item => item.node === node)) {
+          state.hidden.push({ node, value: node.style.getPropertyValue("visibility"), priority: node.style.getPropertyPriority("visibility") });
+          node.style.setProperty("visibility", "hidden", "important");
+        }
+      };
+      globalThis.__fastTabberCapture = state;
+      document.documentElement.append(style);
+      maskShadowHosts();
+      state.observer = new MutationObserver(maskShadowHosts);
+      state.observer.observe(document.documentElement, { childList: true, subtree: true });
+    }});
+    await new Promise(resolve => setTimeout(resolve, 150));
+    let actual = await chrome.tabs.get(tabId);
+    if (actual.url !== tab.url) throw new Error("Page changed before screenshot");
+    const metrics = await command("Page.getLayoutMetrics");
+    const width = Math.min(metrics.cssLayoutViewport.clientWidth, 1280);
+    const height = Math.min(metrics.cssContentSize.height, 900);
+    if (!(width > 0 && height > 0)) throw new Error("Page has no capturable layout");
+    const { data } = await command("Page.captureScreenshot", {
+      format: "jpeg", quality: 80, fromSurface: true, captureBeyondViewport: true,
+      clip: { x: 0, y: 0, width, height, scale: Math.min(1, 1024 / width, 1024 / height) },
+    });
+    actual = await chrome.tabs.get(tabId);
+    if (actual.url !== tab.url) throw new Error("Page changed during screenshot");
+    if (typeof data !== "string" || !data.length || data.length > 6 * 1024 * 1024)
+      throw new Error("Native screenshot format or size is invalid");
+    image = data;
+    pageText = (await extractTabs({ tabIds: [tabId] })).items[0];
+  } finally {
+    captureStatus = { stage: "cleanup", tabId };
+    const errors = [];
+    if (prepared) try {
+      const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: () => {
+        const state = globalThis.__fastTabberCapture;
+        if (!state) return true;
+        state.observer.disconnect();
+        state.style.remove();
+        for (const item of state.hidden) item.node.style.setProperty("visibility", item.value, item.priority);
+        delete globalThis.__fastTabberCapture;
+        return true;
+      }});
+      if (!result) throw new Error("Capture masks were not removed");
+    } catch (error) { errors.push(error.message); }
+    try {
+      if (attached) await chrome.debugger.detach(target);
+    } catch (error) { errors.push(error.message); }
+    try {
+      if (previous) {
+        await chrome.tabs.update(previous.id, { active: true });
+        if (!(await chrome.tabs.get(previous.id)).active) throw new Error("Previous active tab was not restored");
+      }
+      if (captureWindow.state === "minimized") await chrome.windows.update(tab.windowId, { state: "minimized" });
+      if (tab.discarded) {
+        await chrome.tabs.discard(tabId);
+        if (!(await chrome.tabs.get(tabId)).discarded) throw new Error("Originally sleeping tab was not returned to sleep");
+      }
+    } catch (error) { errors.push(error.message); }
+    captureStatus = { stage: errors.length ? "restoration_failed" : "idle" };
+    if (errors.length) throw new Error(`Screenshot restoration incomplete: ${errors.join("; ")}`);
+  }
+  return { id: tab.id, windowId: tab.windowId, url: tab.url, title: pageText?.title || tab.title || "",
+    headings: pageText?.headings || [], text: pageText?.text || "", image };
 }
 
 async function groupCategories({ categories, mode = "batch", expectedUrls = {} }) {
@@ -502,7 +632,7 @@ async function restoreCollection({ collection, mode = "batch" }) {
 
 async function waitForLoad(tabId) {
   const current = await chrome.tabs.get(tabId);
-  if (current.status === "complete" && current.url) return current;
+  if (current.status === "complete" && current.url && !current.discarded) return current;
   await new Promise((resolve, reject) => {
     const finish = error => {
       clearTimeout(timer);
@@ -515,7 +645,7 @@ async function waitForLoad(tabId) {
     const timer = setTimeout(() => finish(new Error("Timed out waiting for the new tab to finish loading")), 15000);
     chrome.tabs.onUpdated.addListener(onUpdated);
     chrome.tabs.get(tabId).then(tab => {
-      if (tab.status === "complete" && tab.url) finish();
+      if (tab.status === "complete" && tab.url && !tab.discarded) finish();
     }).catch(finish);
   });
   return chrome.tabs.get(tabId);
@@ -561,6 +691,9 @@ async function tabAction({ action, tabId, url, windowId, index }) {
   }
   if (action === "activate") {
     const previous = (await chrome.tabs.query({ active: true, windowId: current.windowId }))[0];
+    before.tabs = [];
+    before.groups = {};
+    before.activation = { tabId: previous.id };
     try {
       await chrome.tabs.update(tabId, { active: true });
       const verified = await chrome.tabs.get(tabId);
@@ -596,12 +729,14 @@ async function tabAction({ action, tabId, url, windowId, index }) {
 }
 
 async function connect() {
+  if (connecting || socket && socket.readyState < 2) return;
+  connecting = true;
   try {
     const response = await fetch(chrome.runtime.getURL("pairing.json"));
     if (!response.ok) throw new Error("Run the Fast-Tabber setup command before loading this extension");
     const pairing = await response.json();
     socket = new WebSocket("ws://127.0.0.1:8765/extension");
-    socket.onopen = () => socket.send(JSON.stringify({ token: pairing.token }));
+    socket.onopen = () => socket.send(JSON.stringify({ token: pairing.token, version: chrome.runtime.getManifest().version }));
     socket.onmessage = async ({ data }) => {
       const message = JSON.parse(data);
       if (message.type === "paired") {
@@ -615,7 +750,9 @@ async function connect() {
         const handlers = { probe, list_tabs: listTabs, tab_action: tabAction, group_action: groupAction,
           move_tabs: moveTabs, close_tabs: closeTabs, close_saved_collection: closeSavedCollection, restore_snapshot: restoreSnapshot,
           capture_tabs: ({ tabIds }) => captureTabs(tabIds || []), find_duplicates: findDuplicates,
-          extract_tabs: extractTabs, filter_tabs: filterTabs, group_categories: groupCategories,
+          extract_tabs: extractTabs, filter_tabs: filterTabs, group_categories: groupCategories, capture_page: capturePage,
+          reload_extension: () => { setTimeout(() => chrome.runtime.reload(), 500); return { scheduled: true }; },
+          capture_browser: async () => captureTabs((await chrome.tabs.query({ windowType: "normal" })).filter(tab => !tab.incognito).map(tab => tab.id)),
           restore_collection: restoreCollection };
         if (!handlers[message.operation]) throw new Error("Browser operation is not enabled");
         const result = await handlers[message.operation](message.arguments || {});
@@ -631,8 +768,10 @@ async function connect() {
     socket.onerror = () => socket.close();
   } catch (error) {
     console.error("Fast-Tabber setup error:", error.message);
-  }
+  } finally { connecting = false; }
 }
 
 chrome.runtime.onStartup.addListener(connect);
+chrome.alarms.create("fast-tabber-reconnect", { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "fast-tabber-reconnect") connect(); });
 connect();

@@ -1,44 +1,42 @@
 # Fast-Tabber
 
-Local Chrome tab management through MCP, Codex, and OpenCode + Gemma.
+Chrome tab management inside OpenCode or Codex: an authenticated local MCP server, portable Skill, and minimal Chrome extension. **V5 preview for user testing.** No separate chat application.
 
-**V1–V4 complete.**
+## Install in OpenCode (Windows)
 
-## Setup (Windows)
+Prerequisites: Chrome 120+, OpenCode, [uv](https://docs.astral.sh/uv/getting-started/installation/), and [Ollama](https://ollama.com/download).
 
-```powershell
-uv venv --python 3.13
-uv pip install --python .venv\Scripts\python.exe -r requirements.lock.txt
-ollama pull gemma4:e2b
-ollama pull embeddinggemma-2:740m
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tabber.ps1 setup
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tabber.ps1 check
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tabber.ps1 serve
-```
-
-Install OpenCode 1.19.4 and Codex. In your existing Chrome, open `chrome://extensions`, enable Developer mode, and load this repo's `extension` directory unpacked. The extension has no interface. Keep the service running.
-
-Launch either agent in another terminal:
+Give the release ZIP to OpenCode's **Build** agent and ask it to extract it, read this README, and run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tabber.ps1 local
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tabber.ps1 codex
+powershell -NoProfile -ExecutionPolicy Bypass -File <extracted-folder>\install.ps1 -Workspace <your-project-folder>
 ```
 
-The portable Skill is `.agents/skills/fast-tabber/SKILL.md`; both agents use the same loopback MCP endpoint. Existing global agent settings are not overwritten. Pairing secrets and runtime data are ignored by Git. Page text and 768-dimensional EmbeddingGemma vectors stay in local SQLite. `search_tabs(mode="semantic")` returns bounded matches; `organize_by_text` uses vector clustering or category similarities plus local Gemma labels. Grant ordinary-site access to the extension when Chrome requests it.
+The installer creates the Python environment, installs pinned dependencies, downloads `gemma4:e2b` and `embeddinggemma-2:740m` if missing, verifies text/tool/vision/image-embedding execution, and starts the loopback MCP service. It adds a project plugin without replacing existing agent configurations. A shared runtime registry at `~/.fast-tabber/runtime.json` lets other OpenCode installations reuse the same service, data, and Chrome pairing.
 
-Tab lists expose titles and site origins only; URL paths, queries, and fragments are withheld. Saved collection URLs stay in the local SQLite database. V2 supports native groups, batch/sequential moves, named collections, exact-URL duplicate removal, and undo.
+Restart OpenCode in that project and select **Tabber**, or run `opencode --agent tabber`. Prompt there normally: “Organize my browser”, “Find tabs about robotics”, “Save these tabs”, or “Revert last change”. The Tabber agent allows MCP tools and questions; shell, file editing, and other tools are denied. Use Build for installation or upgrades.
 
-## Checks and privacy
+## Chrome setup
 
-Run `.venv\Scripts\python.exe -m pytest -q`, `node --check extension/background.js`, and `.venv\Scripts\python.exe -m fast_tabber.probe`. For disposable live Chrome tests, set `$env:FAST_TABBER_LIVE_CHROME="1"` and run `.venv\Scripts\python.exe -m pytest -q tests\test_live_chrome_v2.py tests\test_live_chrome_v4.py`.
+First installation only: open `chrome://extensions`, enable Developer mode, and load the runtime's `extension` folder unpacked. Approve Chrome's permissions. The installer prints the exact path. Normal Chrome installations cannot silently install or approve extensions.
 
-V3 text extraction and V4 embeddings/classification run locally. The SQLite index stores rendered text, title, headings, site origin, and vectors, but not full URLs, credentials, form values, or cookies. Search snippets explicitly returned through MCP may enter Codex's cloud context. Unsupported and inaccessible pages are reported and left unchanged. No substitutes are used on failure. Downloaded model digests are recorded after successful preflight. Local inference and Chrome connection validation are separate gates; neither implies the other passed.
+Detection uses an authenticated extension connection, not a process-name guess. If disconnected, MCP tells the agent the exact folder and required user step. Another agent installation on the same machine/user can reuse it; a different Chrome profile needs its own extension approval. Background alarms reconnect after service restarts.
 
-On the fixed four-page live fixture, the V3 keyword query `college application` returns 0/2 relevant admissions pages; EmbeddingGemma retrieves 2/2 in its top four.
+## Scope and local data
 
-For Ollama's local-only mode, merge `"disable_ollama_cloud": true` into `%USERPROFILE%\.ollama\server.json` and restart Ollama after downloads finish. Offline inference was verified with external connections blocked for Ollama and OpenCode. Codex sends necessary tool outputs to its cloud service; never treat Codex mode as fully local.
+Whole-browser screenshot cataloguing runs as a persistent background job. It automatically includes sleeping tabs, processes one page at a time, restores originally discarded tabs to sleep, and checkpoints completed pages. The agent checks job progress and then groups from the saved index without recapturing. Interrupted jobs can resume. Native DevTools capture masks fields/forms/frames and detaches after capture. It may briefly activate a tab; this preview does not claim fully headless capture. Sequential work is paused.
 
-To verify inference with external connections blocked, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\offline.ps1` in Administrator PowerShell. It temporarily blocks only Ollama/OpenCode external connections, tests actual model/MCP execution, and removes its rules in `finally`. Normal operation does not require Administrator rights.
+`.state/browser.sqlite3` stores local URL mappings, chunks, masked images, Gemma descriptions, and direct text/image embeddings. Thinking remains enabled; the server processes small validated batches. Models and browser data are excluded from the ZIP and Git.
 
-Chrome restoration cannot recover unsaved forms or every browser-internal state. Milestones are committed only after tests and actual-browser verification.
+“Revert last change” uses `undo_last`; “revert all” uses `undo_last(all_changes=true)`. Journal snapshots precede mutations. Undo requires compatible running-browser windows; restarts or external changes may need reconciliation. Recovery stops on uncertainty; unsaved forms and arbitrary browser-internal state cannot be recovered.
+
+“Delete local cache” previews counts and requires confirmation. Cache removal preserves saved collections and recovery history; deleting **all** local browser data also removes those. Pairing and model downloads are preserved.
+
+Browser operations, screenshots, indexing, and model processing stay local. MCP results are bounded. Codex or a cloud-configured agent may process returned snippets remotely. The supplied local launcher uses only Ollama:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File <runtime>\tabber.ps1 local
+powershell -NoProfile -ExecutionPolicy Bypass -File <runtime>\tabber.ps1 codex
+```
+
+Fresh package installation and broader acceptance testing are left to the user for this preview. Benchmarking is deferred.

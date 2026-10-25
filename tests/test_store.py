@@ -11,14 +11,14 @@ def test_collection_names_are_unique_and_list_is_compact(tmp_path):
         store.save_collection("research", {"tabs": [], "groups": {}})
 
 
-def test_undo_history_keeps_latest_fifty(tmp_path):
+def test_undo_history_keeps_all_changes_for_revert_all(tmp_path):
     store = StateStore(tmp_path / "browser.sqlite3")
     for index in range(55):
         store.push_undo({"index": index})
     _, latest, status = store.latest_undo()
     assert latest == {"index": 54}
     assert status == "ready"
-    assert store.db.execute("SELECT count(*) FROM undo").fetchone()[0] == 50
+    assert store.db.execute("SELECT count(*) FROM undo").fetchone()[0] == 55
 
 
 def test_undo_claim_prevents_repeating_uncertain_mutation(tmp_path):
@@ -30,6 +30,16 @@ def test_undo_claim_prevents_repeating_uncertain_mutation(tmp_path):
     assert store.claim_undo(entry_id) is False
     store.fail_undo(entry_id)
     assert store.latest_undo()[2] == "failed"
+
+
+def test_catalogue_checkpoint_survives_restart(tmp_path):
+    path = tmp_path / "browser.sqlite3"
+    store = StateStore(path)
+    job = {"id": "job-1", "state": "running", "items": [{"id": 42, "url": "https://example.test/", "done": True}]}
+    store.save_job(job)
+    reopened = StateStore(path)
+    assert reopened.get_job("job-1") == job
+    assert reopened.get_job("") == job
 
 
 def test_page_index_searches_rendered_content_with_bounded_snippet(tmp_path):

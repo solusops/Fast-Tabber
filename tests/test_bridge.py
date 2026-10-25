@@ -34,15 +34,16 @@ def test_tab_tools_are_bounded_and_task_oriented():
             "mcp-protocol-version": "2025-11-25",
         }, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
-            "browser_status", "list_tabs", "tab_action", "organize_tabs",
+            "browser_status", "browser_setup", "list_tabs", "tab_action", "organize_tabs",
             "collection_action", "remove_duplicates", "undo_last", "index_tabs",
-            "search_tabs", "organize_by_text",
+            "search_tabs", "organize_by_text", "local_data", "catalogue_tabs",
         }
         tool = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "list_tabs")
         assert tool["inputSchema"]["properties"]["limit"]["maximum"] == 100
         tools = {item["name"]: item for item in response.json()["result"]["tools"]}
         assert tools["index_tabs"]["annotations"]["readOnlyHint"] is False
         assert tools["search_tabs"]["inputSchema"]["properties"]["mode"]["default"] == "keyword"
+        assert tools["organize_by_text"]["inputSchema"]["properties"]["visual"]["default"] is False
 
 
 def test_list_tabs_rejects_invalid_pagination():

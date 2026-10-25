@@ -7,3 +7,5 @@ node_modules/
 .env
 .superpowers/
 extension/pairing.json
+dist/
+build/

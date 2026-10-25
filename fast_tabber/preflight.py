@@ -65,14 +65,16 @@ async def pull_embeddings(client):
 async def check_models(client):
     digests = require_models(await request(client, "/api/tags"))
     capabilities = {}
-    for name, required in ((GEMMA, {"completion", "tools", "vision"}), (EMBEDDING, {"embedding"})):
+    for name, required in ((GEMMA, {"completion", "tools", "vision"}), (EMBEDDING, {"embedding", "vision"})):
         info = await request(client, "/api/show", {"model": name})
         missing = required - set(info.get("capabilities", []))
         if missing:
             raise RuntimeError(f"{name} lacks required capabilities: {sorted(missing)}")
+        if name == GEMMA and True not in info.get("thinking", {}).get("values", []):
+            raise RuntimeError("The exact Gemma runtime must support thinking")
         capabilities[name] = info["capabilities"]
 
-    common = {"model": GEMMA, "stream": False, "options": {"num_ctx": 8192, "num_predict": 256}}
+    common = {"model": GEMMA, "stream": False, "think": True, "options": {"num_ctx": 16384, "num_predict": 4096}}
     reply = await request(client, "/api/chat", common | {
         "messages": [{"role": "user", "content": "Reply with exactly READY."}],
     })
@@ -105,14 +107,25 @@ async def check_models(client):
     if len(vectors) != 2 or not vectors[0] or len(vectors[0]) != len(vectors[1]) or not all(math.isfinite(x) for v in vectors for x in v) or vectors[0] == vectors[1]:
         raise RuntimeError("EmbeddingGemma returned invalid embeddings")
     print(f"PASS local embeddings ({len(vectors[0])} dimensions)", flush=True)
-    return {"models": digests, "capabilities": capabilities, "embedding_dimensions": len(vectors[0]), "external_inference_block_test": "not yet performed"}
+    images = await request(client, "/api/embed", {"model": EMBEDDING,
+        "input": [{"image": red_image()}, "red", "blue"], "truncate": False})
+    image_vectors = images.get("embeddings", [])
+    if len(image_vectors) != 3 or any(len(vector) != len(vectors[0]) or not any(vector) or
+            not all(math.isfinite(value) for value in vector) for vector in image_vectors):
+        raise RuntimeError("EmbeddingGemma image embedding dimensions are invalid")
+    similarity = lambda a, b: sum(x * y for x, y in zip(a, b)) / math.sqrt(sum(x*x for x in a) * sum(y*y for y in b))
+    if similarity(image_vectors[0], image_vectors[1]) <= similarity(image_vectors[0], image_vectors[2]):
+        raise RuntimeError("EmbeddingGemma did not distinguish the red image from blue text")
+    print("PASS direct image embeddings in the shared text/image space", flush=True)
+    return {"models": digests, "capabilities": capabilities, "embedding_dimensions": len(vectors[0]),
+            "multimodal_embeddings": True, "external_inference_block_test": "not yet performed"}
 
 
 def save_report(report: dict, state: Path):
     state.mkdir(exist_ok=True)
     report_path = state / "models.json"
     if report_path.exists():
-        previous = json.loads(report_path.read_text(encoding="utf-8"))
+        previous = json.loads(report_path.read_text(encoding="utf-8-sig"))
         if previous.get("models") == report["models"] and previous.get("external_inference_block_test", "").startswith("passed:"):
             report["external_inference_block_test"] = previous["external_inference_block_test"]
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
