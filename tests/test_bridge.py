@@ -34,7 +34,8 @@ def test_tab_tools_are_bounded_and_task_oriented():
             "mcp-protocol-version": "2025-11-25",
         }, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
-            "browser_status", "list_tabs", "tab_action"
+            "browser_status", "list_tabs", "tab_action", "organize_tabs",
+            "collection_action", "remove_duplicates", "undo_last",
         }
         tool = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "list_tabs")
         assert tool["inputSchema"]["properties"]["limit"]["maximum"] == 100

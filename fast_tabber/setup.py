@@ -80,7 +80,8 @@ def prepare(root: Path = ROOT):
             "type": "remote", "url": "http://127.0.0.1:8765/mcp", "oauth": False,
             "headers": {"Authorization": "Bearer {env:FAST_TABBER_TOKEN}"},
         }},
-        "permission": {"*": "deny", "fast-tabber_*": "allow", "skill": {"*": "deny", "fast-tabber": "allow"}},
+        "permission": {"*": "deny", "fast-tabber_browser_status": "allow", "fast-tabber_list_tabs": "allow",
+                       "fast-tabber_*": "ask", "skill": {"*": "deny", "fast-tabber": "allow"}},
     }
     (state / "opencode.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     codex = root / ".codex"

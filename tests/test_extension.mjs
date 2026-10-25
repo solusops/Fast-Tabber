@@ -4,7 +4,7 @@ import vm from "node:vm";
 
 const source = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
 const context = vm.createContext({
-  chrome: { runtime: { onStartup: { addListener() {} }, getURL: () => "pairing.json", getManifest: () => ({ version: "0.1.0" }) } },
+  chrome: { runtime: { onStartup: { addListener() {} }, getURL: () => "pairing.json", getManifest: () => ({ version: "0.2.0" }) } },
   fetch: async () => { throw new Error("test context has no extension pairing"); },
   console: { error() {} }, setTimeout, clearInterval, WebSocket: class {}, URL,
 });

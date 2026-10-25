@@ -2,7 +2,7 @@
 
 Local Chrome tab management through MCP, Codex, and OpenCode + Gemma.
 
-**V1 complete.**
+**V1 and V2 complete.**
 
 ## Setup (Windows)
 
@@ -27,11 +27,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tabber.ps1 codex
 
 The portable Skill is `.agents/skills/fast-tabber/SKILL.md`; both agents use the same loopback MCP endpoint. Existing global agent settings are not overwritten. Pairing secrets and runtime data are ignored by Git.
 
-V1 lists titles and site origins only; URL paths, queries, and fragments are withheld to avoid leaking tokens. Tab actions are single-item operations.
+Tab lists expose titles and site origins only; URL paths, queries, and fragments are withheld. Saved collection URLs stay in the local SQLite database. V2 supports native groups, batch/sequential moves, named collections, exact-URL duplicate removal, and undo.
 
 ## Checks and privacy
 
-Run `.venv\Scripts\python.exe -m pytest -q`, `node --check extension/background.js`, and `.venv\Scripts\python.exe -m fast_tabber.probe`.
+Run `.venv\Scripts\python.exe -m pytest -q`, `node --check extension/background.js`, and `.venv\Scripts\python.exe -m fast_tabber.probe`. For the live disposable-tab test, set `$env:FAST_TABBER_LIVE_CHROME="1"` and run `.venv\Scripts\python.exe -m pytest -q tests\test_live_chrome_v2.py`.
 
 Gemma performs local reasoning/vision; EmbeddingGemma provides local embeddings. No substitutes are used on failure. Downloaded model digests are recorded after successful preflight. Local inference and Chrome connection validation are separate gates; neither implies the other passed.
 

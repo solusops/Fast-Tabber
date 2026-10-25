@@ -28,7 +28,9 @@ async def main():
                 tabs = json.loads(tabs_result.content[0].text)
                 if any("?" in tab["url"] or "#" in tab["url"] for tab in tabs["tabs"]):
                     raise RuntimeError("Tab URL query or fragment escaped the privacy filter")
-                print(f"Chrome connected: {status['tabCount']} tabs in {status['windowCount']} windows")
+                print(f"Chrome {status['extensionVersion']} stage={status['stage']}: {status['tabCount']} tabs in {status['windowCount']} windows")
+                print("Extension operations:", ", ".join(status.get("operations", [])))
+                print("Permissions:", ", ".join(status.get("permissions", [])))
                 print(f"Read {len(tabs['tabs'])} bounded tab records; all URL queries and fragments withheld")
                 print("Tab states (id, index, active):", [(tab["id"], tab["index"], tab["active"]) for tab in tabs["tabs"]])
 

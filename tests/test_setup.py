@@ -32,6 +32,14 @@ def test_setup_does_not_replace_existing_codex_config(tmp_path):
     assert config.read_text() == "# user settings\n"
 
 
+def test_opencode_requires_confirmation_for_mutation_tools(tmp_path):
+    project = root(tmp_path)
+    prepare(project)
+    config = json.loads((project / ".state" / "opencode.json").read_text())
+    assert config["permission"]["fast-tabber_list_tabs"] == "allow"
+    assert config["permission"]["fast-tabber_*"] == "ask"
+
+
 def test_corrupt_existing_token_is_rejected(tmp_path):
     project = root(tmp_path)
     (project / ".state").mkdir()
