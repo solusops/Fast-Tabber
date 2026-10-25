@@ -4,8 +4,10 @@ let heartbeat;
 
 async function probe() {
   const permissions = await chrome.permissions.getAll();
-  if (!permissions.permissions.includes("tabs") || !permissions.permissions.includes("tabGroups"))
-    throw new Error("Chrome tabs and tabGroups permissions are required");
+  if (!permissions.permissions.includes("tabs") || !permissions.permissions.includes("tabGroups") ||
+      !permissions.permissions.includes("scripting") || !permissions.origins.some(origin => origin === "http://*/*") ||
+      !permissions.origins.some(origin => origin === "https://*/*"))
+    throw new Error("Chrome tabs, tabGroups, scripting, and ordinary-site access are required");
   const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
   const tabs = await chrome.tabs.query({ windowType: "normal" });
   return {
@@ -14,9 +16,9 @@ async function probe() {
     tabCount: tabs.filter(tab => !tab.incognito).length,
     permissions: permissions.permissions,
     extensionVersion: chrome.runtime.getManifest().version,
-    stage: "v2",
+    stage: "v3",
     operations: ["list_tabs", "tab_action", "group_action", "move_tabs", "collection_action",
-      "close_tabs", "find_duplicates", "restore_snapshot", "undo_last"],
+      "close_tabs", "find_duplicates", "restore_snapshot", "undo_last", "extract_tabs", "filter_tabs", "group_categories"],
   };
 }
 
@@ -319,6 +321,110 @@ async function findDuplicates({ windowId, remove = false, mode = "batch" }) {
   return { removed: result.closed, verified: result.verified, before: result.before };
 }
 
+async function extractTabs({ tabIds, windowId }) {
+  const tabs = tabIds ? await Promise.all(tabIds.map(id => chrome.tabs.get(id))) :
+    await chrome.tabs.query({ windowType: "normal", ...(windowId == null ? {} : { windowId }) });
+  const normal = tabs.filter(tab => !tab.incognito);
+  if (normal.length > 500) throw new Error("Text extraction is limited to 500 tabs per request");
+  const items = [];
+  const failures = [];
+  const extract = () => {
+    const headings = [...document.querySelectorAll("h1,h2,h3")].map(node => (node.innerText || node.textContent || "").trim())
+      .filter(Boolean).slice(0, 10).map(value => value.slice(0, 120));
+    const root = document.querySelector("main,article,[role=main]") || document.body;
+    const copy = root.cloneNode(true);
+    copy.querySelectorAll("script,style,noscript,nav,footer,header,form,input,textarea,select,button,svg,[aria-hidden=true],[contenteditable=true]")
+      .forEach(node => node.remove());
+    const walker = document.createTreeWalker(copy, NodeFilter.SHOW_TEXT);
+    const chunks = [];
+    let previousBlock;
+    while (walker.nextNode()) {
+      const block = walker.currentNode.parentElement.closest("address,article,blockquote,dd,div,dl,dt,figure,h1,h2,h3,h4,li,main,ol,p,pre,section,table,td,tr,ul") || copy;
+      if (block !== previousBlock) chunks.push(" ");
+      chunks.push(walker.currentNode.nodeValue);
+      previousBlock = block;
+    }
+    const text = chunks.join("").replace(/\s+/g, " ").trim().slice(0, 2200);
+    return { title: document.title.slice(0, 200), headings, text };
+  };
+  for (let offset = 0; offset < normal.length; offset += 8) {
+    await Promise.all(normal.slice(offset, offset + 8).map(async tab => {
+      if (!/^https?:\/\//i.test(tab.url || "")) {
+        failures.push({ id: tab.id, reason: "unsupported_url" });
+        return;
+      }
+      try {
+        const [{ result }] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract });
+        if (!result || !result.text && !result.headings.length) {
+          failures.push({ id: tab.id, reason: "no_rendered_text" });
+          return;
+        }
+        if ((await chrome.tabs.get(tab.id)).url !== tab.url) {
+          failures.push({ id: tab.id, reason: "navigation_changed" });
+          return;
+        }
+        items.push({ id: tab.id, windowId: tab.windowId, url: tab.url, title: result.title, headings: result.headings, text: result.text });
+      } catch (error) {
+        failures.push({ id: tab.id, reason: /permission/i.test(error.message || "")
+          ? "missing_site_permission" : "inaccessible_page" });
+      }
+    }));
+  }
+  return { items, failures };
+}
+
+async function filterTabs({ tabIds }) {
+  const existing = [];
+  for (const id of tabIds) {
+    const tab = await getTabIfPresent(id);
+    if (tab && !tab.incognito && /^https?:\/\//i.test(tab.url || "")) existing.push(id);
+  }
+  return { tabIds: existing };
+}
+
+async function groupCategories({ categories, mode = "batch", expectedUrls = {} }) {
+  if (!Array.isArray(categories) || !categories.length || categories.length > 20) throw new Error("Provide 1 to 20 categories");
+  if (!["batch", "sequential"].includes(mode)) throw new Error("mode must be batch or sequential");
+  const used = new Set();
+  const groups = [];
+  for (const category of categories) {
+    if (!category.title || category.title.length > 80 || !Array.isArray(category.tabIds)) throw new Error("Invalid category grouping");
+    const selected = await Promise.all(category.tabIds.map(id => chrome.tabs.get(id)));
+    if (selected.some(tab => tab.incognito || !/^https?:\/\//i.test(tab.url || "")))
+      throw new Error("Only ordinary web tabs can be grouped from page text");
+    if (selected.some(tab => expectedUrls[String(tab.id)] !== tab.url))
+      throw new Error("A tab navigated after text classification; no tabs were grouped");
+    for (const tab of selected) {
+      if (used.has(tab.id)) throw new Error("A tab was assigned to multiple categories");
+      used.add(tab.id);
+      const key = `${category.title}:${tab.windowId}`;
+      let group = groups.find(item => item.key === key);
+      if (!group) groups.push(group = { key, title: category.title, windowId: tab.windowId, tabIds: [] });
+      group.tabIds.push(tab.id);
+    }
+  }
+  if (!used.size) throw new Error("No tabs matched the categories");
+  const before = await captureTabs([...used]);
+  try {
+    for (const group of groups) {
+      const groupId = await chrome.tabs.group({ tabIds: mode === "batch" ? group.tabIds : [group.tabIds[0]] });
+      if (mode === "sequential") for (const id of group.tabIds.slice(1))
+        await chrome.tabs.group({ tabIds: [id], groupId });
+      await chrome.tabGroups.update(groupId, { title: group.title, color: "grey" });
+      const actual = await Promise.all(group.tabIds.map(id => chrome.tabs.get(id)));
+      const metadata = await chrome.tabGroups.get(groupId);
+      if (actual.some(tab => tab.groupId !== groupId || expectedUrls[String(tab.id)] !== tab.url) ||
+          metadata.title !== group.title || metadata.color !== "grey")
+        throw new Error("Page-text group failed verification");
+    }
+  } catch (error) {
+    try { await restoreSnapshot(before); }
+    catch (rollbackError) { throw new Error(`Text grouping failed (${error.message}); restoration incomplete (${rollbackError.message})`); }
+    throw new Error(`Text grouping failed; previous state restored (${error.message})`);
+  }
+  return { grouped: used.size, groups: groups.length, before };
+}
+
 async function restoreCollection({ collection, mode = "batch" }) {
   const records = collection?.tabs || [];
   if (!records.length || records.length > 500) throw new Error("Collection must contain 1 to 500 tabs");
@@ -504,6 +610,7 @@ async function connect() {
         const handlers = { probe, list_tabs: listTabs, tab_action: tabAction, group_action: groupAction,
           move_tabs: moveTabs, close_tabs: closeTabs, close_saved_collection: closeSavedCollection, restore_snapshot: restoreSnapshot,
           capture_tabs: ({ tabIds }) => captureTabs(tabIds || []), find_duplicates: findDuplicates,
+          extract_tabs: extractTabs, filter_tabs: filterTabs, group_categories: groupCategories,
           restore_collection: restoreCollection };
         if (!handlers[message.operation]) throw new Error("Browser operation is not enabled");
         const result = await handlers[message.operation](message.arguments || {});

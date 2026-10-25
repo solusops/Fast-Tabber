@@ -35,7 +35,8 @@ def test_tab_tools_are_bounded_and_task_oriented():
         }, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
             "browser_status", "list_tabs", "tab_action", "organize_tabs",
-            "collection_action", "remove_duplicates", "undo_last",
+            "collection_action", "remove_duplicates", "undo_last", "index_tabs",
+            "search_tabs", "organize_by_text",
         }
         tool = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "list_tabs")
         assert tool["inputSchema"]["properties"]["limit"]["maximum"] == 100
@@ -122,3 +123,8 @@ async def test_timeout_does_not_retry():
         await bridge.call("probe", timeout=0.01)
     assert len(bridge.peer.sent) == 1
     assert bridge.pending == {}
+
+
+async def test_text_extraction_is_enabled_for_local_processing():
+    with pytest.raises(RuntimeError, match="Chrome extension is disconnected"):
+        await Bridge().call("extract_tabs")

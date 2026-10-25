@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Fast-Tabber",
-  "version": "0.2.0",
-  "description": "Manage Chrome tabs through local AI agents.",
+  "version": "0.3.1",
+  "description": "Manage and search Chrome tabs through local AI agents.",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsotBjEvQjDn6KR+1ZjzfNBSa8gEhHmox74dvBCBp9kY8yutvRC4mMovG04spdqrOTthoydhCBgiyRy8y44vuRvs/gSnBJy2sReH2o4/GKSJMScBHQISp5x+TG885F+MfjhgKwCj8kwzG4F0hYb/MCtjXtoTpqLreD4eeEMChy+OM4bhkv3pQZ37WXKuVinNUwip/3YLQVcAH6I+DNG8qG+EKEPTMZMSt2huimbnpl0ZRYVqrC8KUU9zZUUPdsVQAO8/O9F+2W9u1TWjDAE35TkAFiMtkVtQtPhSeeJlnbs3pcEJP0OSlnkjKUHLRFCB3Unhc1hTI0/Puzmtsps0k2wIDAQAB",
-  "permissions": ["tabs", "tabGroups"],
+  "permissions": ["tabs", "tabGroups", "scripting"],
+  "host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "background.js" },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:8765"

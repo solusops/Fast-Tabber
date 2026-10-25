@@ -30,3 +30,25 @@ def test_undo_claim_prevents_repeating_uncertain_mutation(tmp_path):
     assert store.claim_undo(entry_id) is False
     store.fail_undo(entry_id)
     assert store.latest_undo()[2] == "failed"
+
+
+def test_page_index_searches_rendered_content_with_bounded_snippet(tmp_path):
+    store = StateStore(tmp_path / "browser.sqlite3")
+    store.save_pages([{"id": 42, "windowId": 7, "url": "https://user:pass@example.test/private?q=secret",
+                       "title": "Notes", "headings": ["Overview"], "text": "Diffusion policies train robots from demonstrations."}])
+    assert store.search_pages("diffusion policies", 0, 20) == [{
+        "id": 42, "windowId": 7, "title": "Notes", "origin": "https://example.test",
+        "snippet": "Diffusion policies train robots from demonstrations.",
+    }]
+    assert store.count_pages("diffusion") == 1
+    assert store.search_pages("secret", 0, 20) == []
+    url_hash, origin, content = store.db.execute("SELECT url_hash, origin, content FROM pages").fetchone()
+    assert len(url_hash) == 64 and origin == "https://example.test" and "secret" not in content
+
+
+def test_page_index_handles_five_hundred_records(tmp_path):
+    store = StateStore(tmp_path / "browser.sqlite3")
+    store.save_pages([{"id": i + 1, "windowId": 1, "url": f"https://example.test/{i}",
+        "title": "Notes", "headings": [], "text": f"shared research record {i}"} for i in range(500)])
+    assert store.count_pages("shared research") == 500
+    assert len(store.search_pages("shared research", 0, 100)) == 100

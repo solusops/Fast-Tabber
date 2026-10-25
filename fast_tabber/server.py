@@ -2,7 +2,9 @@
 
 import asyncio
 import hmac
+import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import threading
@@ -17,6 +19,7 @@ from pydantic import Field
 from starlette.responses import JSONResponse
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
+from fast_tabber.text import classify_pages
 
 STATE = Path(__file__).resolve().parent.parent / ".state"
 
@@ -29,6 +32,8 @@ class StateStore:
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS collections (name TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             self.db.execute("CREATE TABLE IF NOT EXISTS undo (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ready')")
+            self.db.execute("CREATE TABLE IF NOT EXISTS pages (tab_id INTEGER PRIMARY KEY, window_id INTEGER NOT NULL, url_hash TEXT NOT NULL, title TEXT NOT NULL, origin TEXT NOT NULL, headings TEXT NOT NULL, content TEXT NOT NULL)")
+            self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(title, origin, headings, content, tokenize='unicode61')")
             if "status" not in {row[1] for row in self.db.execute("PRAGMA table_info(undo)")}:
                 self.db.execute("ALTER TABLE undo ADD COLUMN status TEXT NOT NULL DEFAULT 'ready'")
 
@@ -83,6 +88,45 @@ class StateStore:
         with self.lock, self.db:
             self.db.execute("DELETE FROM undo WHERE id=?", (entry_id,))
 
+    def save_pages(self, pages: list[dict]):
+        with self.lock, self.db:
+            for page in pages:
+                tab_id = page["id"]
+                self.db.execute("DELETE FROM pages_fts WHERE rowid=?", (tab_id,))
+                parsed = urlsplit(page["url"])
+                content = page["text"][:3000]
+                headings = " ".join(page["headings"])
+                host = f"[{parsed.hostname}]" if ":" in (parsed.hostname or "") else parsed.hostname
+                origin = f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port else "")
+                digest = hashlib.sha256(json.dumps([page["title"], headings, content], ensure_ascii=False).encode()).hexdigest()
+                self.db.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (tab_id, page["windowId"], digest, page["title"][:200], origin, headings, content))
+                self.db.execute("INSERT INTO pages_fts(rowid, title, origin, headings, content) VALUES (?, ?, ?, ?, ?)",
+                    (tab_id, page["title"][:200], origin, headings, content))
+
+    def remove_pages(self, tab_ids: list[int]):
+        with self.lock, self.db:
+            self.db.executemany("DELETE FROM pages_fts WHERE rowid=?", ((tab_id,) for tab_id in tab_ids))
+            self.db.executemany("DELETE FROM pages WHERE tab_id=?", ((tab_id,) for tab_id in tab_ids))
+
+    def search_pages(self, query: str, offset: int, limit: int):
+        terms = re.findall(r"[\w]+", query, flags=re.UNICODE)
+        if not terms:
+            raise ValueError("query must contain searchable words")
+        match = " AND ".join('"' + term.replace('"', '""') + '"' for term in terms[:20])
+        with self.lock:
+            rows = self.db.execute("SELECT p.tab_id, p.window_id, p.title, p.origin, snippet(pages_fts, 3, '', '', ' … ', 24) FROM pages_fts JOIN pages p ON p.tab_id=pages_fts.rowid WHERE pages_fts MATCH ? ORDER BY bm25(pages_fts) LIMIT ? OFFSET ?",
+                                   (match, limit, offset)).fetchall()
+        return [{"id": row[0], "windowId": row[1], "title": row[2], "origin": row[3], "snippet": row[4][:240]} for row in rows]
+
+    def count_pages(self, query: str):
+        terms = re.findall(r"[\w]+", query, flags=re.UNICODE)
+        if not terms:
+            raise ValueError("query must contain searchable words")
+        match = " AND ".join('"' + term.replace('"', '""') + '"' for term in terms[:20])
+        with self.lock:
+            return self.db.execute("SELECT count(*) FROM pages_fts WHERE pages_fts MATCH ?", (match,)).fetchone()[0]
+
 
 class Bridge:
     def __init__(self):
@@ -93,8 +137,10 @@ class Bridge:
     async def call(self, operation: str, arguments: dict | None = None, timeout: float = 15):
         if operation not in {"probe", "list_tabs", "tab_action", "group_action", "move_tabs", "close_tabs",
                              "close_saved_collection", "restore_snapshot", "capture_tabs", "find_duplicates",
-                             "restore_collection"}:
+                             "restore_collection", "extract_tabs", "filter_tabs", "group_categories"}:
             raise ValueError("Browser operation is not enabled")
+        if operation == "extract_tabs":
+            timeout = max(timeout, 180)
         async with self.lock:
             if self.peer is None:
                 raise RuntimeError("Chrome extension is disconnected. Load/reload extension/ in Chrome.")
@@ -170,7 +216,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
     bridge = Bridge()
     store = StateStore(database or (STATE / "browser.sqlite3"))
     operation_lock = asyncio.Lock()
-    mcp = MCPServer("fast-tabber", version="0.2.0", instructions="Manage Chrome tabs, groups, saved collections, and undo. List tabs to resolve IDs.")
+    mcp = MCPServer("fast-tabber", version="0.3.0", instructions="Manage, search, and organize Chrome tabs using local page text and Gemma.")
 
     async def mutate(operation: str, arguments: dict, collection_name: str | None = None):
         async with operation_lock:
@@ -301,6 +347,73 @@ def create_app(token: str, origin: str, database: Path | None = None):
             result = await mutate("find_duplicates", {"windowId": window_id, "remove": remove, "mode": mode})
             return {key: value for key, value in result.items() if key != "before"}
         except (RuntimeError, ValueError) as error:
+            raise ToolError(str(error)) from error
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+    async def index_tabs(tab_ids: list[int] | None = None, window_id: int | None = None) -> dict:
+        """Extract rendered page text locally and refresh the local search index; returns counts only."""
+        try:
+            if tab_ids is not None and (not tab_ids or len(tab_ids) > 500 or len(set(tab_ids)) != len(tab_ids)):
+                raise ValueError("tab_ids must be unique and contain at most 500 IDs")
+            if tab_ids is not None and window_id is not None:
+                raise ValueError("choose tab_ids or window_id")
+            result = await bridge.call("extract_tabs", {"tabIds": tab_ids, "windowId": window_id})
+            store.save_pages(result["items"])
+            return {"indexed": len(result["items"]), "skipped": len(result["failures"]),
+                    "failures": result["failures"][:20]}
+        except (RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
+            raise ToolError(str(error)) from error
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+    async def search_tabs(query: str, offset: Annotated[int, Field(ge=0)] = 0,
+                          limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict:
+        """Search locally indexed rendered page text and return bounded matching snippets."""
+        try:
+            if len(query) > 500 or offset < 0 or not 1 <= limit <= 100:
+                raise ValueError("query must be at most 500 characters; limit 1 to 100 and offset nonnegative")
+            total = store.count_pages(query)
+            matches = store.search_pages(query, offset, limit)
+            current = await bridge.call("filter_tabs", {"tabIds": [item["id"] for item in matches]})
+            live = set(current["tabIds"])
+            store.remove_pages([item["id"] for item in matches if item["id"] not in live])
+            tabs = [item for item in matches if item["id"] in live]
+            total = store.count_pages(query)
+            return {"total": total, "offset": offset, "limit": limit, "tabs": tabs}
+        except (RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
+            raise ToolError(str(error)) from error
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
+    async def organize_by_text(instruction: str, tab_ids: list[int] | None = None,
+                               window_id: int | None = None, categories: list[str] | None = None,
+                               mode: str = "batch") -> dict:
+        """Classify extracted page content with local Gemma, then natively group verified matches."""
+        try:
+            if mode not in {"batch", "sequential"}:
+                raise ValueError("mode must be batch or sequential")
+            if tab_ids is not None and (not tab_ids or len(tab_ids) > 500 or len(set(tab_ids)) != len(tab_ids)):
+                raise ValueError("tab_ids must be unique and contain at most 500 IDs")
+            if tab_ids is not None and window_id is not None:
+                raise ValueError("choose tab_ids or window_id")
+            extracted = await bridge.call("extract_tabs", {"tabIds": tab_ids, "windowId": window_id})
+            pages = extracted["items"]
+            if not pages:
+                raise ValueError(f"No readable page text; failed tabs: {json.dumps(extracted['failures'][:20])}")
+            store.save_pages(pages)
+            labels = await classify_pages(pages, instruction, categories, STATE)
+            grouped = {}
+            for tab_id, label in labels.items():
+                if label != "Uncategorized":
+                    grouped.setdefault(label, []).append(tab_id)
+            if not grouped:
+                return {"grouped": 0, "uncategorized": len(labels), "skipped": len(extracted["failures"]),
+                        "failures": extracted["failures"][:20], "verified": True}
+            result = await mutate("group_categories", {"categories": [
+                {"title": title, "tabIds": ids} for title, ids in grouped.items()], "mode": mode,
+                "expectedUrls": {str(page["id"]): page["url"] for page in pages}})
+            return {"grouped": result["grouped"], "groups": result["groups"], "categories": list(grouped)[:20],
+                    "uncategorized": sum(label == "Uncategorized" for label in labels.values()),
+                    "skipped": len(extracted["failures"]), "failures": extracted["failures"][:20], "verified": True}
+        except (RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
             raise ToolError(str(error)) from error
 
     @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
