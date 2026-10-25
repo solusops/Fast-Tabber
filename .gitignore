@@ -1,0 +1,9 @@
+.venv/
+.state/
+.pytest_cache/
+__pycache__/
+*.egg-info/
+node_modules/
+.env
+.superpowers/
+extension/pairing.json

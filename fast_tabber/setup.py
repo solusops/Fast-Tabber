@@ -1,0 +1,100 @@
+"""Prepare pairing and agent configuration without changing global agent settings."""
+
+import base64
+import hashlib
+import json
+import re
+import secrets
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def private_path(path: Path, directory=False):
+    if sys.platform != "win32":
+        path.chmod(0o700 if directory else 0o600)
+        return
+    import ntsecuritycon
+    import win32api
+    import win32con
+    import win32security
+
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    try:
+        owner = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    finally:
+        token.Close()
+    acl = win32security.ACL()
+    flags = win32security.OBJECT_INHERIT_ACE | win32security.CONTAINER_INHERIT_ACE if directory else 0
+    for sid in (owner, win32security.CreateWellKnownSid(win32security.WinLocalSystemSid), win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid)):
+        acl.AddAccessAllowedAceEx(win32security.ACL_REVISION, flags, ntsecuritycon.FILE_ALL_ACCESS, sid)
+    win32security.SetNamedSecurityInfo(str(path), win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        None, None, acl, None)
+
+
+def prepare(root: Path = ROOT):
+    state = root / ".state"
+    state.mkdir(exist_ok=True)
+    private_path(state, directory=True)
+    manifest = json.loads((root / "extension" / "manifest.json").read_text(encoding="utf-8"))
+    digest = hashlib.sha256(base64.b64decode(manifest["key"], validate=True)).hexdigest()[:32]
+    extension_id = "".join(chr(ord("a") + int(char, 16)) for char in digest)
+    origin = f"chrome-extension://{extension_id}"
+    path = state / "connection.json"
+    if path.exists():
+        connection = json.loads(path.read_text(encoding="utf-8"))
+        if not re.fullmatch(r"[0-9a-f]{64}", connection.get("token", "")) or connection.get("origin") != origin:
+            raise RuntimeError("Invalid existing pairing state; inspect .state/connection.json before changing it")
+    else:
+        connection = {"token": secrets.token_hex(32), "origin": origin}
+        path.write_text(json.dumps(connection, indent=2), encoding="utf-8")
+    pairing = root / "extension" / "pairing.json"
+    pairing.touch(exist_ok=True)
+    private_path(pairing)
+    pairing.write_text(json.dumps({"token": connection["token"]}), encoding="utf-8")
+
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "model": "ollama/gemma4:e2b",
+        "small_model": "ollama/gemma4:e2b",
+        "enabled_providers": ["ollama"],
+        "autoupdate": False,
+        "share": "disabled",
+        "plugin": [],
+        "skills": {"paths": [str(root / ".agents" / "skills")]},
+        "provider": {"ollama": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "Ollama (local only)",
+            "options": {"baseURL": "http://127.0.0.1:11434/v1"},
+            "models": {"gemma4:e2b": {
+                "name": "Gemma 4 E2B (local)",
+                "limit": {"context": 8192, "output": 1024},
+                "tool_call": True,
+                "attachment": True,
+                "modalities": {"input": ["text", "image"], "output": ["text"]},
+            }},
+        }},
+        "mcp": {"fast-tabber": {
+            "type": "remote", "url": "http://127.0.0.1:8765/mcp", "oauth": False,
+            "headers": {"Authorization": "Bearer {env:FAST_TABBER_TOKEN}"},
+        }},
+        "permission": {"*": "deny", "fast-tabber_*": "allow", "skill": {"*": "deny", "fast-tabber": "allow"}},
+    }
+    (state / "opencode.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    codex = root / ".codex"
+    codex.mkdir(exist_ok=True)
+    target = codex / "config.toml"
+    if not target.exists():
+        target.write_text(
+            '[mcp_servers.fast-tabber]\nurl = "http://127.0.0.1:8765/mcp"\n'
+            'bearer_token_env_var = "FAST_TABBER_TOKEN"\n', encoding="utf-8",
+        )
+    return connection
+
+
+if __name__ == "__main__":
+    result = prepare()
+    print(f"Pairing prepared for {result['origin']}. Token is stored locally and is not printed.")
+    print(f"Load unpacked extension in Chrome: {ROOT / 'extension'}")
