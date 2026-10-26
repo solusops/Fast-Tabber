@@ -26,7 +26,7 @@ def model_name(path=None):
 
 
 GEMMA = "gemma4:e2b"  # Compatibility export; runtime inference uses model_name().
-EMBEDDING = "embeddinggemma-2:740m"
+EMBEDDING = "embeddinggemma-2:440m"
 
 
 def require_models(payload: dict) -> dict[str, str]:

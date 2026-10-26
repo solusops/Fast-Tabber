@@ -408,7 +408,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         return decorate
     serialized_processing = serialized(processing_lock)
     serialized_catalogue = serialized(catalogue_control_lock)
-    mcp = MCPServer("fast-tabber", version="0.5.3", instructions="Manage, search, and organize Chrome tabs with local Gemma text, vision, and semantic embeddings.")
+    mcp = MCPServer("fast-tabber", version="0.5.4", instructions="Manage, search, and organize Chrome tabs with local Gemma text, vision, and semantic embeddings.")
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, open_world_hint=True))
     async def onboarding(action: Literal["status", "select_model", "download", "verify", "browser"] = "status",
@@ -1060,7 +1060,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         await bridge.connect(socket, token, origin)
 
     async def health(request):
-        return JSONResponse({"name": "fast-tabber", "version": "0.5.3", "root": str(STATE.parent),
+        return JSONResponse({"name": "fast-tabber", "version": "0.5.4", "root": str(STATE.parent),
             "connected": bridge.peer is not None, "extensionVersion": bridge.extension_version, "pid": os.getpid(),
             "busy": operation_lock.locked() or processing_lock.locked() or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values())})
 
