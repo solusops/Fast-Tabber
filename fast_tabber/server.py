@@ -23,7 +23,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import WebSocketRoute, Route
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from fast_tabber.semantic import cosine
@@ -386,6 +386,12 @@ class LocalAuthentication:
             provided = headers.get(b"authorization", b"")
             expected = f"Bearer {self.token}".encode()
             origin = headers.get(b"origin")
+            if scope["path"] in {"/setup", "/setup.js", "/setup.css"} and scope["method"] == "GET":
+                if headers.get(b"host") != b"127.0.0.1:8765" or origin and origin != b"http://127.0.0.1:8765":
+                    await JSONResponse({"error": "Untrusted setup origin"}, status_code=403)(scope, receive, send)
+                    return
+                await self.app(scope, receive, send)
+                return
             if not hmac.compare_digest(provided, expected):
                 await JSONResponse({"error": "Authentication required"}, status_code=401)(scope, receive, send)
                 return
@@ -426,7 +432,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         return decorate
     serialized_processing = serialized(processing_lock)
     serialized_catalogue = serialized(catalogue_control_lock)
-    mcp = MCPServer("fast-tabber", version="0.7.0", instructions="Manage Chrome tabs and explicitly requested bookmarks. Local EmbeddingGemma supplies indexing; the connected agent supplies reasoning. Keep results bounded and user tabs open during grouping.")
+    mcp = MCPServer("fast-tabber", version="0.7.1", instructions="Manage Chrome tabs and explicitly requested bookmarks. Local EmbeddingGemma supplies indexing; the connected agent supplies reasoning. Keep results bounded and user tabs open during grouping.")
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, open_world_hint=True))
     async def onboarding(action: Literal["status", "download", "verify", "browser", "acknowledge_privacy"] = "status",
@@ -441,8 +447,8 @@ def create_app(token: str, origin: str, database: Path | None = None):
                 return {"connected": False, "verified": False, "error": str(error),
                         "extensionFolder": str(STATE.parent / "extension"),
                         "steps": ["Open your normal Chrome profile and install/enable Fast-Tabber",
-                                  "Until the store listing is live, load extensionFolder unpacked at chrome://extensions",
-                                  "Approve any requested permissions", "Call browser_setup(action='pair') and paste the code in the extension's Pair with agent section",
+                                  "Load extensionFolder unpacked at chrome://extensions",
+                                  "Approve any requested permissions", "Call browser_setup(action='pair'), open setupUrl in Chrome and click Connect Fast-Tabber",
                                   "Reply in this agent chat when ready; the agent must call onboarding(action='browser') again"],
                         "awaitingUserReply": True}
         return await setup.call(action, model, confirm)
@@ -497,7 +503,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, open_world_hint=False))
     async def browser_setup(action: Literal["reload_extension", "pair"] = "reload_extension") -> dict[str, Any]:
-        """Issue a five-minute single-use pairing code, or reload an already paired unpacked extension."""
+        """Create a five-minute one-click Chrome setup link (no code copying), or reload an already paired unpacked extension. Manual code is recovery only."""
         if action == "pair":
             return {**pairing.issue(), "extensionOrigin": origin}
         if action != "reload_extension":
@@ -730,7 +736,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         await bridge.connect(socket, pairing.token, origin, pairing, legacy_token=token)
 
     async def health(request):
-        return JSONResponse({"name": "fast-tabber", "version": "0.7.0", "root": str(STATE.parent),
+        return JSONResponse({"name": "fast-tabber", "version": "0.7.1", "root": str(STATE.parent),
             "connected": bridge.peer is not None, "extensionVersion": bridge.extension_version, "pid": os.getpid(),
             "busy": operation_lock.locked() or processing_lock.locked() or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values())})
 
@@ -752,7 +758,20 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except RuntimeError as error:
             return JSONResponse({"error": str(error)}, status_code=409)
 
+    async def setup_page(request):
+        base = Path(__file__).resolve().parent
+        name, media = {"/setup": ("setup.html", "text/html"), "/setup.js": ("setup-page.js", "text/javascript"),
+                       "/setup.css": ("setup-page.css", "text/css")}[request.url.path]
+        content = (base / name).read_text(encoding="utf-8")
+        if name.endswith(".js"):
+            content = content.replace("__CONFIG__", json.dumps({"extensionId": origin.removeprefix("chrome-extension://"),
+                                                               "folder": str(STATE.parent / "extension")}))
+        return Response(content, media_type=media, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+            "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"})
+
     app.router.routes.append(WebSocketRoute("/extension", extension))
+    app.router.routes.extend(Route(path, setup_page) for path in ("/setup", "/setup.js", "/setup.css"))
     app.router.routes.extend([Route("/health", health), Route("/shutdown", shutdown, methods=["POST"]),
                               Route("/reload-extension", reload_extension, methods=["POST"])])
     app.state.bridge = bridge

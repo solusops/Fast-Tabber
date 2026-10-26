@@ -43,3 +43,18 @@ def test_store_pairing_and_browser_credentials_cannot_access_mcp(tmp_path):
         with client.websocket_connect("/extension", headers={"origin": ORIGIN}) as ws:
             ws.send_json({"token": browser_token, "version": "0.7.0"})
             assert ws.receive_json()["type"] == "paired"
+
+
+def test_setup_page_is_local_public_static_only_without_credentials(tmp_path):
+    with TestClient(create_app(TOKEN, ORIGIN, tmp_path / "browser.sqlite3"), base_url="http://127.0.0.1:8765") as client:
+        for path in ("/setup", "/setup.js", "/setup.css"):
+            response = client.get(path)
+            assert response.status_code == 200
+            assert TOKEN not in response.text and "pairingCode" not in response.text
+            assert response.headers["cache-control"] == "no-store"
+            assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+            assert client.get(path, headers={"host":"evil.test"}).status_code == 403
+            assert client.get(path, headers={"origin":"https://evil.test"}).status_code == 403
+        assert "__CONFIG__" not in client.get("/setup.js").text
+        assert client.get("/health").status_code == 401
+        assert client.post("/setup").status_code == 401

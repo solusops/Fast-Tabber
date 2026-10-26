@@ -32,11 +32,6 @@ extension = root / "dist" / f"fast-tabber-extension-{version}.zip"
 with ZipFile(extension, "w", ZIP_DEFLATED) as archive:
     for path in files:
         if path.parent == root / "extension":
-            if path.name == "manifest.json":
-                manifest = json.loads(path.read_text())
-                manifest.pop("key", None)
-                archive.writestr(path.name, json.dumps(manifest, indent=2))
-            else:
-                archive.write(path, path.name)
+            archive.write(path, path.name)
 extension.with_suffix(".zip.sha256").write_text(f"{sha256(extension.read_bytes()).hexdigest()}  {extension.name}\n")
 print(extension)

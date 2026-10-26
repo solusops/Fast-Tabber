@@ -12,7 +12,7 @@ Call `onboarding(action="status")`. Show its privacy disclosure once and acknowl
 
 Only EmbeddingGemma 2 440M is required by the backend. If missing, explain its role/download and obtain yes before `action="download", model="embeddinggemma-2:440m", confirm=true`. Verify with `action="verify"` and poll status until complete/failed. Never announce polling without executing it. Native browser operations do not require a generative model or embeddings. Keep the user's existing agent/model configuration.
 
-Check `onboarding(action="browser")`. If disconnected, show returned setup steps/path. Call `browser_setup(action="pair")` for a single-use code valid for five minutes; ask the user to paste it into the extension popup's Pair with agent section. Do not expose the persistent MCP token. Wait for the user's chat reply, then check again. The reply alone does not prove connectivity. Bookmark permission is optional: ask the user to click the extension's Enable bookmarks button only when bookmark access is requested.
+Check `onboarding(action="browser")`. If disconnected, call `browser_setup(action="pair")` and show its clickable setupUrl. The local page explains loading the unpacked extension and lets the user click Connect Fast-Tabber without copying a code. The link expires in five minutes. Manual code entry in the toolbar popup is recovery only. Do not expose the persistent MCP token. Wait for the user's chat reply, then check again. The reply alone does not prove connectivity. Bookmark permission is optional: ask the user to click the extension's Enable bookmarks button only when bookmark access is requested.
 
 ## Scope and evidence
 

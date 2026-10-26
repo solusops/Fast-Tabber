@@ -42,6 +42,9 @@ if (!$StartOnly) {
             New-Item -ItemType Directory -Path (Join-Path $TabberRoot $TabberDirectory) -Force | Out-Null
         }
         Get-ChildItem -LiteralPath (Join-Path $TabberSource 'fast_tabber') -Filter '*.py' | Copy-Item -Destination (Join-Path $TabberRoot 'fast_tabber') -Force
+        foreach ($TabberAsset in @('setup.html','setup-page.js','setup-page.css')) {
+            Copy-Item -LiteralPath (Join-Path $TabberSource "fast_tabber\$TabberAsset") -Destination (Join-Path $TabberRoot "fast_tabber\$TabberAsset") -Force
+        }
         foreach ($TabberFile in @('extension\manifest.json','extension\background.js','extension\bookmarks.js','extension\content.js','extension\export.js','extension\popup.html','extension\popup.css','extension\popup.js','.agents\skills\fast-tabber\SKILL.md','requirements.lock.txt','pyproject.toml','package.json','tabber.ps1','opencode-plugin.js','runtime.js','cli.js','install.ps1','install.cmd','README.md','LICENSE')) {
             Copy-Item -LiteralPath (Join-Path $TabberSource $TabberFile) -Destination (Join-Path $TabberRoot $TabberFile) -Force
         }

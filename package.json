@@ -1,15 +1,52 @@
 {
   "name": "fast-tabber-toolkit",
-  "version": "0.7.0-preview.1",
+  "version": "0.7.1-preview.1",
   "description": "Local-first Chrome tabs and bookmarks through MCP and your existing AI agent",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/solusops/Fast-Tabber.git" },
-  "bin": { "fast-tabber": "./cli.js" },
-  "engines": { "node": ">=22" },
-  "os": ["win32"],
-  "publishConfig": { "access": "public", "tag": "next" },
-  "files": ["cli.js", "runtime.js", "opencode-plugin.js", "install.ps1", "install.cmd", "tabber.ps1", "pyproject.toml", "requirements.lock.txt", "fast_tabber/*.py", "extension/manifest.json", "extension/background.js", "extension/bookmarks.js", "extension/content.js", "extension/export.js", "extension/popup.html", "extension/popup.css", "extension/popup.js", ".agents/skills/fast-tabber/SKILL.md", "PRIVACY.md"],
-  "scripts": { "test": "node tests/test_extension.mjs && node tests/test_bookmarks.mjs && node tests/test_popup.mjs && node tests/test_pairing.mjs" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/solusops/Fast-Tabber.git"
+  },
+  "bin": {
+    "fast-tabber": "./cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "os": [
+    "win32"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "files": [
+    "cli.js",
+    "runtime.js",
+    "opencode-plugin.js",
+    "install.ps1",
+    "install.cmd",
+    "tabber.ps1",
+    "pyproject.toml",
+    "requirements.lock.txt",
+    "fast_tabber/*.py",
+    "extension/manifest.json",
+    "extension/background.js",
+    "extension/bookmarks.js",
+    "extension/content.js",
+    "extension/export.js",
+    "extension/popup.html",
+    "extension/popup.css",
+    "extension/popup.js",
+    ".agents/skills/fast-tabber/SKILL.md",
+    "PRIVACY.md",
+    "fast_tabber/setup.html",
+    "fast_tabber/setup-page.js",
+    "fast_tabber/setup-page.css"
+  ],
+  "scripts": {
+    "test": "node tests/test_extension.mjs && node tests/test_bookmarks.mjs && node tests/test_popup.mjs && node tests/test_pairing.mjs"
+  },
   "type": "module",
   "main": "./opencode-plugin.js",
   "exports": "./opencode-plugin.js"

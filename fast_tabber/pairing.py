@@ -14,8 +14,8 @@ class Pairing:
     def issue(self):
         self.code = secrets.token_hex(16)
         self.expires = time.monotonic() + 300
-        return {"pairingCode": self.code, "expiresInSeconds": 300,
-                "steps": ["Open the Fast-Tabber Chrome toolbar popup", "Paste this code into Pair with agent and click Pair",
+        return {"pairingCode": self.code, "setupUrl": "http://127.0.0.1:8765/setup#" + self.code, "expiresInSeconds": 300,
+                "steps": ["Open setupUrl in Chrome", "Load the unpacked extension if needed, then click Connect Fast-Tabber on the setup page",
                           "Reply here; the agent must check browser_status to confirm the connection"]}
 
     def consume(self, code):

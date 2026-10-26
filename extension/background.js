@@ -812,11 +812,12 @@ async function connect() {
 }
 
 chrome.runtime.onStartup.addListener(connect);
-chrome.runtime.onMessage.addListener((message, sender, respond) => {
-  if (sender.id !== chrome.runtime.id || message.type !== "pair") return;
+function handlePair(message, respond) {
+  if (message.type !== "pair") return;
   (async () => {
     try {
       if (!/^[0-9a-f]{32}$/.test(message.code)) throw new Error("Paste the 32-character code supplied by your agent");
+      if (socket && socket.readyState === WebSocket.OPEN) { respond({ started: true }); return; }
       await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
       await chrome.storage.local.set({ pairing: { pairingCode: message.code } });
       if (socket) socket.close();
@@ -825,6 +826,14 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     } catch (error) { respond({ error: error.message }); }
   })();
   return true;
+}
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (sender.id !== chrome.runtime.id) return;
+  return handlePair(message, respond);
+});
+chrome.runtime.onMessageExternal.addListener((message, sender, respond) => {
+  if (sender.id || sender.frameId !== 0 || sender.origin !== "http://127.0.0.1:8765" || sender.url !== "http://127.0.0.1:8765/setup") return;
+  return handlePair(message, respond);
 });
 chrome.alarms.create("fast-tabber-reconnect", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "fast-tabber-reconnect") connect(); });

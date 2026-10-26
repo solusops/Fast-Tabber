@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Fast-Tabber</title><link rel="stylesheet" href="/setup.css"></head>
+<body><main><h1>Connect Fast-Tabber</h1>
+<p>Allow your existing agent to manage this Chrome profile through the local toolkit.</p>
+<details><summary>First installation: load the Chrome extension</summary>
+<ol><li>Open <strong>chrome://extensions</strong> and enable Developer mode.</li><li>Click <strong>Load unpacked</strong> and select this folder:<pre id="folder"></pre></li><li>Enable Fast-Tabber, then return here.</li></ol>
+<p>Bookmark access is optional and can be enabled later in the toolbar popup. Keep this folder in place for future updates.</p></details>
+<button id="connect" type="button">Connect Fast-Tabber</button>
+<p id="status" role="status" aria-live="polite">This request expires after five minutes. No code copying is needed.</p>
+<p>Browser data stays in the local toolkit unless your agent requests it. A cloud-connected agent may send selected evidence to its provider.</p>
+</main><script src="/setup.js"></script></body></html>
