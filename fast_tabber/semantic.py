@@ -48,7 +48,7 @@ async def embedding_digest(state: Path, client_factory=httpx.AsyncClient):
     except httpx.HTTPError as error:
         raise RuntimeError(f"Local EmbeddingGemma is unavailable ({type(error).__name__})") from error
     except (OSError, KeyError, ValueError) as error:
-        raise RuntimeError("Verified model report is missing or invalid; run tabber.ps1 check") from error
+        raise RuntimeError("Embedding verification is missing or invalid; use onboarding(action='verify')") from error
     if digest != recorded:
         raise RuntimeError("Installed EmbeddingGemma digest differs from preflight; run tabber.ps1 check")
     return digest

@@ -13,28 +13,25 @@ from fast_tabber.server import create_app
 
 
 @pytest.mark.asyncio
-async def test_e4b_selection_and_each_download_require_explicit_approval(tmp_path, monkeypatch):
+async def test_only_embedding_download_requires_approval_and_no_generative_model(tmp_path, monkeypatch):
     setup = Onboarding(tmp_path, SimpleNamespace(peer=None), lambda: False, asyncio.Lock())
-    selected = await setup.call("select_model", "gemma4:e4b", False)
-    assert selected["selectedModel"] == "gemma4:e4b" and not selected["downloaded"]
-    assert preflight.model_name(tmp_path / "settings.json") == "gemma4:e4b"
     assert setup.task is None
-    for model in ("gemma4:e4b", preflight.EMBEDDING):
+    for model in (preflight.EMBEDDING,):
         prompt = await setup.call("download", model, False)
         assert prompt["requiresConfirmation"] and prompt["downloadStarted"] is False
         assert setup.task is None
-    with pytest.raises(ToolError, match="Select"):
+    with pytest.raises(ToolError, match="requires only"):
         await setup.call("download", "gemma4:e2b", True)
     requested = []
     original = httpx.AsyncClient
     def handler(request):
         requested.append((request.method, request.url.path))
         if request.url.path == "/api/pull":
-            assert json.loads(request.content)["name"] == "gemma4:e4b"
+            assert json.loads(request.content)["name"] == preflight.EMBEDDING
             return httpx.Response(200, text='{"status":"success"}\n')
-        return httpx.Response(200, json={"models": [{"name": "gemma4:e4b"}]})
+        return httpx.Response(200, json={"models": [{"name": preflight.EMBEDDING, "digest": "verified"}]})
     monkeypatch.setattr("fast_tabber.onboarding.httpx.AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
-    started = await setup.call("download", "gemma4:e4b", True)
+    started = await setup.call("download", preflight.EMBEDDING, True)
     assert started["started"]
     await setup.task
     assert setup.progress["state"] == "complete"

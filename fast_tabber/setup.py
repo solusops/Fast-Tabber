@@ -69,8 +69,6 @@ def prepare(root: Path = ROOT):
 
     config = {
         "$schema": "https://opencode.ai/config.json",
-        "model": "ollama/" + model_name(),
-        "small_model": "ollama/" + model_name(),
         "enabled_providers": ["ollama"],
         "autoupdate": False,
         "share": "disabled",
@@ -96,6 +94,14 @@ def prepare(root: Path = ROOT):
         "permission": {"*": "deny", "fast-tabber_browser_status": "allow", "fast-tabber_list_tabs": "allow",
                        "fast-tabber_*": "ask", "skill": {"*": "deny", "fast-tabber": "allow"}},
     }
+    # An existing explicit launcher preference is preserved; no model is selected or downloaded by the server.
+    settings_path = state / "settings.json"
+    selected = json.loads(settings_path.read_text()).get("model") if settings_path.exists() else None
+    if selected:
+        config["model"] = "ollama/" + selected
+        config["small_model"] = config["model"]
+    else:
+        config["provider"]["ollama"]["models"] = {}
     (state / "opencode.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     codex = root / ".codex"
     codex.mkdir(exist_ok=True)

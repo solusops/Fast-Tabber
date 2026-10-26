@@ -8,9 +8,10 @@ files = [root / name for name in (
     "install.ps1", "install.cmd", "opencode-plugin.js", "package.json", "pyproject.toml",
     "requirements.lock.txt", "tabber.ps1", "README.md", "LICENSE",
     "extension/manifest.json", "extension/background.js",
+    "extension/bookmarks.js", "extension/content.js", "extension/export.js", "extension/popup.html", "extension/popup.css", "extension/popup.js",
     ".agents/skills/fast-tabber/SKILL.md",
 )] + sorted((root / "fast_tabber").glob("*.py"))
-target = root / "dist" / "fast-tabber-0.5.4-preview.5.zip"
+target = root / "dist" / "fast-tabber-0.6.0-preview.1.zip"
 target.parent.mkdir(exist_ok=True)
 with ZipFile(target, "w", ZIP_DEFLATED) as archive:
     for path in files:

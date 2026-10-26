@@ -49,7 +49,7 @@ def local_pages():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["batch", "sequential"])
-async def test_v4_body_semantic_search_and_gemma_groups(local_pages, mode):
+async def test_body_semantic_search_and_native_groups(local_pages, mode):
     connection = json.loads((STATE / "connection.json").read_text(encoding="utf-8-sig"))
     ids = []
     undo_db = sqlite3.connect(STATE / "browser.sqlite3")
@@ -76,7 +76,8 @@ async def test_v4_body_semantic_search_and_gemma_groups(local_pages, mode):
                         opened = await call("tab_action", {"action": "open",
                             "url": f"{local_pages}{path}", "window_id": window_id})
                         ids.append(opened["tab"]["id"])
-                    indexed = await call("index_tabs", {"tab_ids": ids})
+                    await call("onboarding", {"action":"acknowledge_privacy","confirm":True})
+                    indexed = await call("index_tabs", {"tab_ids": ids, "confirm_index":True})
                     assert indexed["indexed"] == 4 and indexed["skipped"] == 0 and 0 <= indexed["embedded"] <= 4
                     found = await call("search_tabs", {"query": "diffusion manipulation demonstrations"})
                     assert len(found["tabs"]) == 1 and found["tabs"][0]["id"] == ids[0]

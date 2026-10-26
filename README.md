@@ -1,54 +1,38 @@
 # Fast-Tabber
 
-Chrome tab management inside OpenCode or Codex: an authenticated local MCP server, portable Skill, and minimal Chrome extension. **V5 preview for user testing.** No separate chat application.
+Local-first Chrome tabs and bookmarks through your existing MCP agent. EmbeddingGemma 2 440M supplies text/image embeddings; your connected agent supplies reasoning. No backend generative model or extra chatbot.
 
-## Install in OpenCode (Windows)
+## Install (Windows)
 
-Prerequisites: Chrome 120+, OpenCode, [uv](https://docs.astral.sh/uv/getting-started/installation/), and [Ollama](https://ollama.com/download).
+Prerequisites: Chrome 120+, an MCP-compatible agent, and [uv](https://docs.astral.sh/uv/getting-started/installation/). [Ollama](https://ollama.com/download) is needed for semantic indexing/grouping, not native tab/bookmark operations.
 
-Ollama must bind to loopback with `OLLAMA_CONTEXT_LENGTH=32768`; restart an existing Ollama service after changing these settings. The installer uses them when starting Ollama. Model verification during chat onboarding checks the actual OpenCode-compatible tool/result round trip. No model substitution is used.
-
-Give the release ZIP to OpenCode's **Build** agent and ask it to extract it, read this README, and run:
+Give the release ZIP to OpenCode Build, extract it and run:
 
 ```powershell
 <extracted-folder>\install.cmd -Workspace <your-project-folder>
 ```
 
-The installer creates the Python environment, installs pinned dependencies and starts the loopback MCP service. **It never downloads models.** It adds a project plugin without replacing existing agent configurations. A shared runtime registry at `~/.fast-tabber/runtime.json` lets other OpenCode installations reuse the same service, data, and Chrome pairing.
+The installer preserves existing agent configuration, creates the Python environment and registers a project plugin. It never downloads models. Restart OpenCode and use `/tabs set up Fast-Tabber` or select Tabber. Your existing chat model is retained. Other MCP clients use the authenticated Streamable HTTP endpoint `http://127.0.0.1:8765/mcp`; the private runtime `.state/connection.json` supplies the bearer token. Install the portable `.agents/skills/fast-tabber` Skill in the client's supported skill directory. Codex can use the generated `.codex/config.toml` with `FAST_TABBER_TOKEN` set locally.
 
-In your already working agent chat, ask `/tabs set up Fast-Tabber`. The agent explains model roles and asks which local Gemma tag to use, including installed options. Each missing model needs its own yes before a download starts; installed models are reused. The embedding model is `embeddinggemma-2:440m`. Download progress and actual inference verification are checked through MCP. After model selection/verification, restart OpenCode to use that model in Tabber. Initial onboarding uses your existing working chat model; it cannot bootstrap a local agent that has no usable inference model.
+First Chrome pairing: load the runtime's `extension` folder unpacked at `chrome://extensions` and approve site permissions. Setup prints the path and checks the connection again after you reply in agent chat. Other agents on the same machine/profile reuse this pairing. The black-and-white popup exports open tabs, grouped tabs, all bookmarks or checked bookmarks as TXT/CSV. Grouped exports retain group names. **Enable bookmarks** requests optional Chrome permission; declining does not disable tabs.
 
-Require a successful installer exit, then restart OpenCode in that project and use `/tabs list my tabs`, select **Tabber**, or run `opencode --agent tabber`. Selecting the Skill alone does not install MCP or switch agents. Prompt normally: “Organize my browser”, “Find tabs about robotics”, “Save these tabs”, or “Revert last change”. The Tabber agent allows MCP tools and questions; shell, file editing, and other tools are denied. Use Build for installation or upgrades.
+## Workflow
 
-## Chrome setup
+First-run onboarding discloses privacy, checks Ollama/Chrome, asks before downloading `embeddinggemma-2:440m` if missing, and verifies actual text/image embeddings. No Gemma 4 installation is required. Native operations work without Ollama.
 
-First installation only: open `chrome://extensions`, enable Developer mode, and load the runtime's `extension` folder unpacked. Approve Chrome's permissions. The installer prints the exact path. Normal Chrome installations cannot silently install or approve extensions.
+Tabs are the default scope. Bookmark operations/indexing require an explicit bookmark request. Index with permission, starting with inexpensive metadata. Extract text, accessibility or screenshots only on demand; sleeping pages can be loaded for requested inspection. Cached representations are reused. There are no automatic freshness sweeps; refresh explicitly when necessary. Bookmark page inspection closes only its own disposable tab.
 
-Detection uses an authenticated extension connection, not a process-name guess. Onboarding checks it live. If disconnected, the agent shows the exact folder and browser setup steps, waits for your chat reply, then checks again. A reply alone never marks pairing successful. Another agent installation on the same machine/user can reuse it; a different Chrome profile needs its own extension approval. Background alarms reconnect after service restarts.
+- **Fast:** embeddings, local clustering and keyword/representative-title labels; immediately apply native tab groups or bookmark folders. Approximate matches may remain unclassified.
+- **Precise:** return a compact grouping plan; the connected agent inspects selected evidence, refines names/membership and applies it. Complex requests use the agent's reasoning. Delegated autonomy is supported.
 
-## Scope and local data
+Grouping keeps user tabs open and never deletes bookmarks. Closing/deletion are separate, explicitly requested actions preceded by a warning. Export complete collections or links inside webpages to local TXT/CSV. Lists/plans/search are paginated (20 default, 100 maximum). Actual selected images can be returned through MCP; the agent never receives the entire collection automatically.
 
-For natural-language organization, OpenCode asks **Simple** or **Rigorous** before processing. Simple uses rendered text and cache with no screenshots; insufficient evidence remains Uncategorized. Rigorous adds screenshots for unresolved pages and warns that Chrome may activate. Unselected requests return a choice instead of starting a job; direct screenshot organization sweeps are disabled.
+Undo uses the existing journal. Bookmark undo can recreate IDs; external changes or uncertain outcomes stop restoration. Unsaved forms and arbitrary browser state cannot be recovered. Cache deletion previews counts and requires confirmation; deleting all local data also removes recovery/collections.
 
-Cataloguing supports up to 2,000 tabs. Sleeping pages without cached text are loaded individually in the background, read and returned to sleep without changing focus. Text is bounded to 12,000 characters per page and chunked locally. Screenshot capture masks fields/forms/frames, restores Chrome window geometry/state and detaches. Discard/restoration failures stop the job. This preview does not claim fully headless capture.
+## Data and limits
 
-Recovery collections and progress checkpoints use batches of 50; cached index artifacts remain durable between checkpoints. Interrupted jobs can resume. The agent applies the saved classification after completion, without recapturing. Optional archive-and-close requires explicit confirmation, saves batches before closure and journals verified close operations. Unsaved forms/session state cannot be restored by reopening URLs. Sequential work is paused.
+SQLite stores metadata, chunks, images, float16 vectors and FTS5 locally. Similarity computation does not use float16 model inference. Selected URLs/text/images may reach a cloud model provider; local inference depends on the agent/model and other integrations. No absolute confidentiality claim. Cookies/form values are not requested. Webpage evidence is untrusted.
 
-`.state/browser.sqlite3` stores local URL mappings, chunks, masked images, Gemma descriptions, and direct text/image embeddings. Thinking remains enabled; the server processes small validated batches. Models and browser data are excluded from the ZIP and Git.
+Native screenshots may activate Chrome; capture covers a top rectangle capped at 1280×900, scaled to a 1024-pixel longest side. Ollama controls visual token preprocessing; Fast-Tabber does not claim a verified fixed visual-token budget. Model-digest/task-prefix changes require new vectors; cached content remains reusable.
 
-Embedding images currently use Ollama's runtime preprocessing default; no visual token budget is explicitly requested or verified. Native screenshots cover a top-of-page rectangle capped at 1280×900 before scaling the longest side to 1024 pixels. This pixel limit is separate from the model's visual token budget. Switching embedding model digests requires regenerating vectors; cached text and screenshots remain reusable.
-
-“Revert last change” uses `undo_last`; “revert all” uses `undo_last(all_changes=true)`. Journal snapshots precede mutations. Undo requires compatible running-browser windows; restarts or external changes may need reconciliation. Recovery stops on uncertainty; unsaved forms and arbitrary browser-internal state cannot be recovered.
-
-“Delete local cache” previews counts and requires confirmation. Cache removal preserves saved collections and recovery history; deleting **all** local browser data also removes those. Pairing and model downloads are preserved.
-
-Browser operations, screenshots, indexing, and model processing stay local. MCP results are bounded. Codex or a cloud-configured agent may process returned snippets remotely. The supplied local launcher uses only Ollama:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File <runtime>\tabber.ps1 local
-powershell -NoProfile -ExecutionPolicy Bypass -File <runtime>\tabber.ps1 codex
-```
-
-Fresh package installation and broader acceptance testing are left to the user for this preview. Benchmarking is deferred.
-
-Interface references: [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools), [Agent Skills](https://agentskills.io/specification), [OpenCode plugins](https://opencode.ai/docs/plugins/). The portable Skill supplies workflow instructions; MCP exposes executable tools. The OpenCode adapter registers both without embedding the entire Skill in every system prompt.
+Preview: fresh-machine installation, broad grouping quality and large real-browser performance need user acceptance testing. [DigUp's persistent SQLite/FTS5/vector design](https://github.com/ARahim3/DigUp) informed the approach; no DigUp UI/code is bundled. MIT license. Benchmarking remains deferred.

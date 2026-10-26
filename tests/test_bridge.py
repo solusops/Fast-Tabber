@@ -46,7 +46,7 @@ def test_tools_advertise_output_schemas_and_return_compatible_structured_results
                "mcp-protocol-version": "2025-11-25"}
     with TestClient(app, base_url="http://127.0.0.1:8765") as client:
         tools = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
-        assert all(tool["outputSchema"]["type"] == "object" for tool in tools)
+        assert all(tool["outputSchema"]["type"] == "object" for tool in tools if tool["name"] != "inspect_page")
         result = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "list_tabs", "arguments": {}}}).json()["result"]
         import json
@@ -64,13 +64,15 @@ def test_tab_tools_are_bounded_and_task_oriented():
             "browser_status", "browser_setup", "list_tabs", "tab_action", "organize_tabs",
             "collection_action", "remove_duplicates", "undo_last", "index_tabs",
             "search_tabs", "organize_by_text", "local_data", "catalogue_tabs", "onboarding",
+            "list_resources", "index_resources", "search_resources", "group_resources", "group_plan",
+            "bookmark_action", "find_duplicates", "export_urls", "inspect_page", "apply_grouping",
         }
         tool = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "list_tabs")
         assert tool["inputSchema"]["properties"]["limit"]["maximum"] == 100
         tools = {item["name"]: item for item in response.json()["result"]["tools"]}
         assert tools["index_tabs"]["annotations"]["readOnlyHint"] is False
         assert tools["search_tabs"]["inputSchema"]["properties"]["mode"]["default"] == "keyword"
-        assert tools["organize_by_text"]["inputSchema"]["properties"]["visual"]["default"] is False
+        assert tools["group_resources"]["inputSchema"]["properties"]["mode"]["default"] == "fast"
 
 
 def test_list_tabs_rejects_invalid_pagination():

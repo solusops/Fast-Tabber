@@ -19,14 +19,13 @@ def test_records_exact_model_digests():
     assert require_models({"models": [
         {"name": "gemma4:e2b", "digest": "abc"},
         {"name": "embeddinggemma-2:440m", "digest": "def"},
-    ]}) == {"gemma4:e2b": "abc", "embeddinggemma-2:440m": "def"}
+    ]}) == {"embeddinggemma-2:440m": "def"}
 
 
 def test_empty_digest_fails():
     with pytest.raises(RuntimeError, match="digest"):
         require_models({"models": [
-            {"name": "gemma4:e2b", "digest": ""},
-            {"name": "embeddinggemma-2:440m", "digest": "def"},
+            {"name": "embeddinggemma-2:440m", "digest": ""},
         ]})
 
 

@@ -8,6 +8,7 @@ const context = vm.createContext({
   fetch: async () => { throw new Error("test context has no extension pairing"); },
   console: { error() {} }, setTimeout, clearTimeout, clearInterval, WebSocket: class {}, URL,
 });
+context.importScripts = (...names) => names.forEach(name => vm.runInContext(readFileSync(new URL(`../extension/${name}`, import.meta.url), "utf8"), context));
 vm.runInContext(source, context);
 const safeUrl = vm.runInContext("safeUrl", context);
 

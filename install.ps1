@@ -30,7 +30,7 @@ function Get-TabberHealth {
 Get-Command uv -ErrorAction Stop | Out-Null
 $TabberOllamaCommand = Get-Command ollama -ErrorAction SilentlyContinue
 $TabberOllama = if ($TabberOllamaCommand) { $TabberOllamaCommand.Source } else { Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Ollama\ollama.exe' }
-if (!(Test-Path -LiteralPath $TabberOllama)) { throw 'Install Ollama, then restart OpenCode or add ollama.exe to PATH.' }
+if (!(Test-Path -LiteralPath $TabberOllama)) { Write-Output 'Ollama is not installed; native browser operations remain available. Install it before semantic onboarding.'; $TabberOllama = $null }
 $TabberHealth = Get-TabberHealth
 if (!$StartOnly) {
     if ($TabberHealth) {
@@ -42,7 +42,7 @@ if (!$StartOnly) {
             New-Item -ItemType Directory -Path (Join-Path $TabberRoot $TabberDirectory) -Force | Out-Null
         }
         Get-ChildItem -LiteralPath (Join-Path $TabberSource 'fast_tabber') -Filter '*.py' | Copy-Item -Destination (Join-Path $TabberRoot 'fast_tabber') -Force
-        foreach ($TabberFile in @('extension\manifest.json','extension\background.js','.agents\skills\fast-tabber\SKILL.md','requirements.lock.txt','pyproject.toml','package.json','tabber.ps1','opencode-plugin.js','install.ps1','install.cmd','README.md','LICENSE')) {
+        foreach ($TabberFile in @('extension\manifest.json','extension\background.js','extension\bookmarks.js','extension\content.js','extension\export.js','extension\popup.html','extension\popup.css','extension\popup.js','.agents\skills\fast-tabber\SKILL.md','requirements.lock.txt','pyproject.toml','package.json','tabber.ps1','opencode-plugin.js','install.ps1','install.cmd','README.md','LICENSE')) {
             Copy-Item -LiteralPath (Join-Path $TabberSource $TabberFile) -Destination (Join-Path $TabberRoot $TabberFile) -Force
         }
     }
@@ -54,18 +54,19 @@ if (!$StartOnly) {
     Invoke-TabberCommand 'uv' @('pip','install','--python',$TabberPython,'-r',(Join-Path $TabberRoot 'requirements.lock.txt'))
     Invoke-TabberCommand $TabberPython @('-m','fast_tabber.setup')
 }
-$env:OLLAMA_HOST = '127.0.0.1:11434'
-$env:OLLAMA_NO_CLOUD = '1'
-$env:OLLAMA_CONTEXT_LENGTH = '32768'
-try { $TabberModels = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3 } catch {
-    Start-Process -FilePath $TabberOllama -ArgumentList 'serve' -WorkingDirectory $TabberRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $TabberRoot '.state\ollama.stdout.log') -RedirectStandardError (Join-Path $TabberRoot '.state\ollama.stderr.log') | Out-Null
-    for ($TabberWait=0; $TabberWait -lt 30; $TabberWait++) {
-        Start-Sleep -Seconds 1
-        try { $TabberModels = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 2; break } catch {}
+if ($TabberOllama) {
+    $env:OLLAMA_HOST = '127.0.0.1:11434'
+    $env:OLLAMA_NO_CLOUD = '1'
+    try { $TabberModels = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3 } catch {
+        Start-Process -FilePath $TabberOllama -ArgumentList 'serve' -WorkingDirectory $TabberRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $TabberRoot '.state\ollama.stdout.log') -RedirectStandardError (Join-Path $TabberRoot '.state\ollama.stderr.log') | Out-Null
+        for ($TabberWait=0; $TabberWait -lt 30; $TabberWait++) {
+            Start-Sleep -Seconds 1
+            try { $TabberModels = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 2; break } catch {}
+        }
+        if (!$TabberModels) { throw 'Ollama did not start on loopback.' }
     }
-    if (!$TabberModels) { throw 'Ollama did not start on loopback.' }
+    if (Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue | Where-Object LocalAddress -NotIn @('127.0.0.1','::1')) { throw 'Ollama must bind only to loopback; configure OLLAMA_HOST=127.0.0.1:11434 and restart it.' }
 }
-if (Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue | Where-Object LocalAddress -NotIn @('127.0.0.1','::1')) { throw 'Ollama must bind only to loopback; configure OLLAMA_HOST=127.0.0.1:11434 and restart it.' }
 if (!$StartOnly) {
     $TabberHealth = Get-TabberHealth
     if ($TabberHealth) {
@@ -95,7 +96,7 @@ if (!$StartOnly) {
     [IO.File]::WriteAllText($TabberEntry, "// Fast-Tabber managed entry`nexport { FastTabberPlugin } from $TabberModule;`n", (New-Object Text.UTF8Encoding($false)))
     Write-Output "Installed MCP server + Skill. Restart OpenCode in: $Workspace"
     Write-Output 'Use /tabs list my tabs, or select Tabber. Selecting the Skill alone does not install MCP or switch agents.'
-    Write-Output 'No models were downloaded. In agent chat ask Fast-Tabber to onboard: select your local model, approve each missing download separately, verify models, then confirm Chrome pairing.'
+    Write-Output 'No models were downloaded. In agent chat onboard Fast-Tabber: disclose privacy, approve EmbeddingGemma if missing, verify embeddings, then confirm Chrome. Your existing agent supplies reasoning.'
     Write-Output "Existing Chrome pairing reused when available. First installation only: load $TabberRoot\extension in Chrome and approve its permissions."
 }
 $TabberExpectedVersion = (Get-Content -LiteralPath (Join-Path $TabberRoot 'extension\manifest.json') -Raw | ConvertFrom-Json).version

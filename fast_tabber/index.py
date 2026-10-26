@@ -35,6 +35,8 @@ class ContentIndex:
             db.execute("CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, url TEXT NOT NULL, title TEXT NOT NULL, headings TEXT NOT NULL, content TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, kind TEXT NOT NULL, content BLOB NOT NULL, description TEXT, description_model TEXT, embedding BLOB, embedding_model TEXT)")
             db.execute("CREATE TABLE IF NOT EXISTS document_artifacts (document_id TEXT, ordinal INTEGER, artifact_id TEXT NOT NULL, PRIMARY KEY(document_id,ordinal))")
+            if "encoding" not in {row[1] for row in db.execute("PRAGMA table_info(artifacts)")}:
+                db.execute("ALTER TABLE artifacts ADD COLUMN encoding TEXT NOT NULL DEFAULT 'f32'")
 
     def document(self, page):
         parsed = urlsplit(page["url"])
@@ -78,9 +80,10 @@ class ContentIndex:
         if not row:
             return None
         with self.lock:
-            visual = self.db.execute("SELECT 1 FROM document_artifacts d JOIN artifacts a ON a.id=d.artifact_id WHERE d.document_id=? AND a.kind='image' AND a.embedding IS NOT NULL LIMIT 1", (row[0],)).fetchone() is not None
+            image = self.db.execute("SELECT a.id FROM document_artifacts d JOIN artifacts a ON a.id=d.artifact_id WHERE d.document_id=? AND a.kind='image' LIMIT 1", (row[0],)).fetchone()
         return {"id": metadata["id"], "windowId": metadata["windowId"], "url": metadata["url"],
-                "title": row[1], "headings": json.loads(row[2]), "text": row[3], "cached": True, "visual": visual}
+                "title": row[1], "headings": json.loads(row[2]), "text": row[3], "cached": True, "visual": image is not None,
+                **({"image_id": image[0]} if image else {})}
 
     def save_description(self, key, model, description):
         with self.lock, self.db:
@@ -105,17 +108,19 @@ class ContentIndex:
         validate_embeddings({"embeddings": vectors}, len(keys))
         with self.lock, self.db:
             for key, vector in zip(keys, vectors):
-                self.db.execute("UPDATE artifacts SET embedding=?,embedding_model=? WHERE id=?",
-                    (struct.pack(f"<{len(vector)}f", *vector), model, key))
+                norm = math.sqrt(sum(value * value for value in vector))
+                self.db.execute("UPDATE artifacts SET embedding=?,embedding_model=?,encoding='f16' WHERE id=?",
+                    (struct.pack(f"<{len(vector)}e", *(value / norm for value in vector)), model, key))
 
     def page_vector(self, keys, model):
         vectors = []
         with self.lock:
             for key in keys:
-                row = self.db.execute("SELECT embedding FROM artifacts WHERE id=? AND embedding_model=?", (key, model)).fetchone()
+                row = self.db.execute("SELECT embedding,encoding FROM artifacts WHERE id=? AND embedding_model=?", (key, model)).fetchone()
                 if not row or not row[0]:
                     raise RuntimeError("The local multimodal index is incomplete; resume index_tabs")
-                vectors.append(struct.unpack(f"<{len(row[0]) // 4}f", row[0]))
+                size, code = (2, "e") if row[1] == "f16" else (4, "f")
+                vectors.append(struct.unpack(f"<{len(row[0]) // size}{code}", row[0]))
         validate_embeddings({"embeddings": [list(vector) for vector in vectors]}, len(keys))
         mean = [sum(values) / len(vectors) for values in zip(*vectors)]
         norm = math.sqrt(sum(value * value for value in mean))

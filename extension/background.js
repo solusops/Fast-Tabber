@@ -1,4 +1,5 @@
 // Chrome 116+ keeps an extension worker alive while its WebSocket exchanges messages.
+importScripts("bookmarks.js", "content.js");
 let socket;
 let heartbeat;
 let connecting = false;
@@ -779,7 +780,8 @@ async function connect() {
           extract_tabs: extractTabs, filter_tabs: filterTabs, group_categories: groupCategories, capture_page: capturePage,
           reload_extension: () => { setTimeout(() => chrome.runtime.reload(), 500); return { scheduled: true }; },
           capture_browser: async () => captureTabs((await chrome.tabs.query({ windowType: "normal" })).filter(tab => !tab.incognito).map(tab => tab.id)),
-          restore_collection: restoreCollection };
+          restore_collection: restoreCollection, bookmark_tree: bookmarkTree, bookmark_action: bookmarkAction,
+          restore_bookmarks: restoreBookmarks, inspect_page: inspectPage };
         if (!handlers[message.operation]) throw new Error("Browser operation is not enabled");
         const result = await handlers[message.operation](message.arguments || {});
         socket.send(JSON.stringify({ id: message.id, result }));

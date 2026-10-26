@@ -1,68 +1,60 @@
-"""Explicit model setup; no downloads on import, installation, or status checks."""
+"""First-run disclosure and approved embedding setup. No generative-model dependency."""
 import asyncio
 import json
-import re
-
 import httpx
 from mcp.server.mcpserver.exceptions import ToolError
-
 from fast_tabber import preflight
+
+DISCLOSURE = ("Bulk indexing, clustering, embeddings and saved data stay local. Your connected agent may send requested titles, "
+    "URLs, text, accessibility data and screenshots to its model provider. A local agent/model can keep inference on-device, "
+    "subject to its other integrations. Fast-Tabber does not request cookies or form values.")
 
 
 class Onboarding:
     def __init__(self, state, bridge, busy, inference_lock):
         self.state, self.bridge, self.busy, self.inference_lock = state, bridge, busy, inference_lock
-        self.task = None
-        self.progress = {"state": "idle"}
+        self.task, self.progress = None, {"state": "idle"}
 
     async def status(self):
-        settings = self.state / "settings.json"
-        selected = preflight.model_name(settings) if settings.exists() else None
+        error, installed = None, {}
         try:
             async with httpx.AsyncClient(base_url=preflight.OLLAMA, timeout=5, trust_env=False) as client:
-                response = await client.get("/api/tags")
-                response.raise_for_status()
-                models = response.json()["models"]
-            installed = {item["name"]: item for item in models}
-            runtime_error = None
-        except (httpx.HTTPError, KeyError, ValueError) as error:
-            installed, runtime_error = {}, f"Ollama unavailable on loopback: {type(error).__name__}. Install/start Ollama at 127.0.0.1:11434."
-        report = self.state / "models.json"
-        verified = json.loads(report.read_text()).get("models", {}) if report.exists() else {}
-        required = ([selected] if selected else []) + [preflight.EMBEDDING]
-        return {"selectedModel": selected, "runtimeError": runtime_error,
-                "requiresModelSelection": selected is None,
-                "models": [{"name": name, "purpose": "instruction following and screenshots" if name == selected else "text/image semantic index",
-                            "installed": name in installed, "sizeBytes": installed.get(name, {}).get("size"),
-                            "verified": bool(name in installed and verified.get(name) == installed[name].get("digest"))} for name in required],
-                "availableGemmaModels": [name for name in installed if name.startswith("gemma4:")][:20],
-                "downloadConfirmationRequired": True, "progress": self.progress,
-                "browserConnected": self.bridge.peer is not None,
-                "nextStep": "Select the user's model; explain and confirm each missing download separately, then verify models and check the browser connection."}
+                reply = await client.get("/api/tags")
+                reply.raise_for_status()
+                installed = {item["name"]: item for item in reply.json()["models"]}
+        except (httpx.HTTPError, ValueError, KeyError) as failure:
+            error = f"Ollama unavailable on loopback ({type(failure).__name__}); install/start Ollama at 127.0.0.1:11434. Native browser operations remain available."
+        path = self.state / "models.json"
+        report = json.loads(path.read_text()).get("models", {}) if path.exists() else {}
+        settings = self.state / "settings.json"
+        privacy = json.loads(settings.read_text()).get("privacy_acknowledged", False) if settings.exists() else False
+        name = preflight.EMBEDDING
+        return {"models": [{"name": name, "installed": name in installed, "sizeBytes": installed.get(name, {}).get("size"),
+                "verified": name in installed and report.get(name) == installed[name].get("digest")}],
+                "runtimeError": error, "progress": self.progress, "privacyAcknowledged": privacy, "privacyDisclosure": DISCLOSURE,
+                "browserConnected": self.bridge.peer is not None, "downloadConfirmationRequired": True,
+                "nextStep": "Disclose privacy once; approve any missing embedding download, verify embeddings and check Chrome. Use the connected agent's existing model for reasoning."}
 
-    async def run(self, action, model):
+    async def run(self, action):
         try:
             async with self.inference_lock:
                 async with httpx.AsyncClient(base_url=preflight.OLLAMA, timeout=3600, trust_env=False) as client:
                     if action == "download":
-                        async with client.stream("POST", "/api/pull", json={"name": model, "stream": True}) as response:
+                        async with client.stream("POST", "/api/pull", json={"name": preflight.EMBEDDING, "stream": True}) as response:
                             response.raise_for_status()
                             async for line in response.aiter_lines():
-                                if not line:
-                                    continue
-                                data = json.loads(line)
-                                if data.get("error"):
-                                    raise RuntimeError(data["error"])
-                                self.progress.update(status=data.get("status"), completed=data.get("completed"), total=data.get("total"))
+                                if line:
+                                    data = json.loads(line)
+                                    if data.get("error"):
+                                        raise RuntimeError(data["error"])
+                                    self.progress.update(status=data.get("status"), completed=data.get("completed"), total=data.get("total"))
                         if self.progress.get("status") != "success":
-                            raise RuntimeError("Ollama did not report a completed download")
+                            raise RuntimeError("Embedding download did not complete")
                         tags = await client.get("/api/tags")
                         tags.raise_for_status()
-                        if model not in {item["name"] for item in tags.json()["models"]}:
-                            raise RuntimeError("Downloaded model is not present in Ollama")
+                        preflight.require_models(tags.json())
                     else:
-                        report = await preflight.check_models(client)
-                        preflight.save_report(report, self.state)
+                        preflight.save_report(await preflight.check_models(client), self.state)
             self.progress["state"] = "complete"
         except Exception as error:
             self.progress.update(state="failed", error=str(error)[:500])
@@ -71,26 +63,22 @@ class Onboarding:
         if action == "status":
             return await self.status()
         if self.task and not self.task.done() or self.busy():
-            raise ToolError("Finish the active setup/browser operation before changing models")
-        selected = preflight.model_name(self.state / "settings.json")
-        if action == "select_model":
-            settings = self.state / "settings.json"
-            # Validate before persisting; never substitute a smaller model automatically.
-            if not re.fullmatch(r"gemma4:[a-zA-Z0-9_.-]+", model) or "cloud" in model.lower():
-                raise ToolError("Choose an explicit local gemma4 tag, such as the user's installed model")
-            settings.write_text(json.dumps({"model": model}))
-            return {"selectedModel": model, "downloaded": False, "agentRestartRequired": True,
-                    "nextStep": "Check status; ask before each missing download. Restart OpenCode to use the selected chat model."}
-        if not (self.state / "settings.json").exists():
-            raise ToolError("Ask the user which local Gemma model to use and select it before downloading or verifying")
-        if action == "download":
-            if model not in {selected, preflight.EMBEDDING}:
-                raise ToolError("Select the requested Gemma model first; downloads are limited to that model and the required embedding model")
+            raise ToolError("Finish the current operation first")
+        if action == "acknowledge_privacy":
             if not confirm:
-                return {"requiresConfirmation": True, "model": model, "downloadStarted": False,
-                        "message": "Explain the model's role and potentially multi-GB download, then wait for the user's yes for this exact model."}
+                return {"requiresDisclosure": True, "privacyDisclosure": DISCLOSURE}
+            path = self.state / "settings.json"
+            settings = json.loads(path.read_text()) if path.exists() else {}
+            settings["privacy_acknowledged"] = True
+            path.write_text(json.dumps(settings))
+            return {"acknowledged": True}
+        if action == "download":
+            if model != preflight.EMBEDDING:
+                raise ToolError(f"This server requires only {preflight.EMBEDDING}; select your chat model in the connected agent")
+            if not confirm:
+                return {"requiresConfirmation": True, "model": model, "downloadStarted": False}
         elif action != "verify":
-            raise ToolError("Choose status, select_model, download, verify, or browser")
-        self.progress = {"state": "running", "action": action, "model": model if action == "download" else selected}
-        self.task = asyncio.create_task(self.run(action, model))
-        return {"started": True, "progress": self.progress, "nextStep": "Poll onboarding status; do not assume success until complete."}
+            raise ToolError("Choose status, download, verify, browser or acknowledge_privacy")
+        self.progress = {"state": "running", "action": action, "model": preflight.EMBEDDING}
+        self.task = asyncio.create_task(self.run(action))
+        return {"started": True, "progress": self.progress, "nextStep": "Poll status until complete or failed; do not merely announce polling."}
