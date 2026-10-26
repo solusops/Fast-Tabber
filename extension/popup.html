@@ -4,12 +4,16 @@
   <h1>Fast-Tabber</h1><p>Export URLs from this Chrome profile.</p>
   <label>Format <select id="format"><option value="txt">TXT</option><option value="csv">CSV</option></select></label>
   <button id="tabs">Download open tabs</button>
-  <button id="groups">Download grouped tabs</button>
+  <h2>Tab groups</h2>
+  <div id="tab-groups" class="checklist" role="group" aria-label="Tab group checklist"></div>
+  <button id="selected-groups" disabled>Download selected groups</button>
+  <button id="groups">Download all grouped tabs</button>
   <hr><h2>Bookmarks</h2><button id="enable" hidden>Enable bookmarks</button>
   <button id="download-all" disabled>Download all bookmarks</button>
+  <div id="folders" class="checklist" role="group" aria-label="Bookmark folder checklist"></div>
   <label><input type="checkbox" id="all"> Select all bookmarks</label>
   <input id="filter" type="search" placeholder="Filter bookmarks" aria-label="Filter bookmarks">
-  <div id="bookmarks" role="group" aria-label="Bookmark checklist"></div>
+  <div id="bookmarks" class="checklist" role="group" aria-label="Bookmark checklist"></div>
   <button id="download" disabled>Download selected bookmarks</button>
   <p id="status" role="status" aria-live="polite"></p>
 </main><script src="export.js"></script><script src="popup.js"></script></body></html>

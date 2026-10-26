@@ -14,7 +14,7 @@ Give the release ZIP to OpenCode Build, extract it and run:
 
 The installer preserves existing agent configuration, creates the Python environment and registers a project plugin. It never downloads models. Restart OpenCode and use `/tabs set up Fast-Tabber` or select Tabber. Your existing chat model is retained. Other MCP clients use the authenticated Streamable HTTP endpoint `http://127.0.0.1:8765/mcp`; the private runtime `.state/connection.json` supplies the bearer token. Install the portable `.agents/skills/fast-tabber` Skill in the client's supported skill directory. Codex can use the generated `.codex/config.toml` with `FAST_TABBER_TOKEN` set locally.
 
-First Chrome pairing: load the runtime's `extension` folder unpacked at `chrome://extensions` and approve site permissions. Setup prints the path and checks the connection again after you reply in agent chat. Other agents on the same machine/profile reuse this pairing. The black-and-white popup exports open tabs, grouped tabs, all bookmarks or checked bookmarks as TXT/CSV. Grouped exports retain group names. **Enable bookmarks** requests optional Chrome permission; declining does not disable tabs.
+First Chrome pairing: load the runtime's `extension` folder unpacked at `chrome://extensions` and approve site permissions. Setup prints the path and checks the connection again after you reply in agent chat. Other agents on the same machine/profile reuse this pairing. The black-and-white popup exports open tabs, selected or all tab groups, all bookmarks or checked bookmarks as TXT/CSV. Folder checkboxes include nested bookmarks. Grouped exports retain group names. **Enable bookmarks** requests optional Chrome permission; declining does not disable tabs.
 
 ## Workflow
 
