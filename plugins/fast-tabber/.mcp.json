@@ -4,7 +4,7 @@
       "command": "npx.cmd",
       "args": [
         "-y",
-        "fast-tabber-toolkit@1.0.0",
+        "fast-tabber-toolkit@latest",
         "mcp"
       ]
     }
