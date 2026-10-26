@@ -3,27 +3,13 @@
 import base64
 import hashlib
 import json
-import math
-import struct
 from urllib.parse import urlsplit, urlunsplit
 
-from fast_tabber.semantic import validate_embeddings
 
 
-def chunks(text, size=1600, overlap=160):
-    result = []
-    start = 0
-    while start < len(text):
-        end = min(start + size, len(text))
-        if end < len(text):
-            boundary = text.rfind(" ", start + size // 2, end)
-            if boundary > start:
-                end = boundary
-        result.append(text[start:end])
-        if end == len(text):
-            break
-        start = max(start + 1, end - overlap)
-    return result or [""]
+def chunks(text, size=12000, overlap=0):
+    """Keep one bounded first-page representation; no crawler-style passage overlap."""
+    return [text[:size]]
 
 
 class ContentIndex:
@@ -68,14 +54,10 @@ class ContentIndex:
             self.db.execute("INSERT OR IGNORE INTO artifacts(id,kind,content) VALUES (?,'image',?)", (key, raw))
         return key
 
-    def description(self, key, model):
-        with self.lock:
-            row = self.db.execute("SELECT description FROM artifacts WHERE id=? AND description_model=?", (key, model)).fetchone()
-        return row[0] if row else None
 
     def cached_page(self, metadata):
         with self.lock:
-            row = self.db.execute("SELECT id,title,headings,content FROM documents WHERE url=? AND title=? ORDER BY rowid DESC LIMIT 1",
+            row = self.db.execute("SELECT id,title,headings,content FROM documents WHERE url=? ORDER BY (title=?) DESC,rowid DESC LIMIT 1",
                                   (metadata["url"], metadata.get("title", ""))).fetchone()
         if not row:
             return None
@@ -85,45 +67,7 @@ class ContentIndex:
                 "title": row[1], "headings": json.loads(row[2]), "text": row[3], "cached": True, "visual": image is not None,
                 **({"image_id": image[0]} if image else {})}
 
-    def save_description(self, key, model, description):
-        with self.lock, self.db:
-            self.db.execute("UPDATE artifacts SET description=?,description_model=? WHERE id=?", (description, model, key))
 
     def artifacts(self, document):
         with self.lock:
             return [row[0] for row in self.db.execute("SELECT artifact_id FROM document_artifacts WHERE document_id=? ORDER BY ordinal", (document,))]
-
-    def pending(self, keys, model):
-        result = []
-        with self.lock:
-            for key in dict.fromkeys(keys):
-                row = self.db.execute("SELECT kind,content,embedding,embedding_model FROM artifacts WHERE id=?", (key,)).fetchone()
-                if row is None:
-                    raise RuntimeError("A local index artifact is missing")
-                if row[2] is None or row[3] != model:
-                    result.append((key, row[1].decode() if row[0] == "text" else {"image": base64.b64encode(row[1]).decode()}))
-        return result
-
-    def save_vectors(self, keys, vectors, model):
-        validate_embeddings({"embeddings": vectors}, len(keys))
-        with self.lock, self.db:
-            for key, vector in zip(keys, vectors):
-                norm = math.sqrt(sum(value * value for value in vector))
-                self.db.execute("UPDATE artifacts SET embedding=?,embedding_model=?,encoding='f16' WHERE id=?",
-                    (struct.pack(f"<{len(vector)}e", *(value / norm for value in vector)), model, key))
-
-    def page_vector(self, keys, model):
-        vectors = []
-        with self.lock:
-            for key in keys:
-                row = self.db.execute("SELECT embedding,encoding FROM artifacts WHERE id=? AND embedding_model=?", (key, model)).fetchone()
-                if not row or not row[0]:
-                    raise RuntimeError("The local multimodal index is incomplete; resume index_tabs")
-                size, code = (2, "e") if row[1] == "f16" else (4, "f")
-                vectors.append(struct.unpack(f"<{len(row[0]) // size}{code}", row[0]))
-        validate_embeddings({"embeddings": [list(vector) for vector in vectors]}, len(keys))
-        mean = [sum(values) / len(vectors) for values in zip(*vectors)]
-        norm = math.sqrt(sum(value * value for value in mean))
-        if not norm:
-            raise RuntimeError("Multimodal page vector has zero norm")
-        return [value / norm for value in mean]

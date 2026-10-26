@@ -1,4 +1,4 @@
-"""Local tab/bookmark indexing and clustering. No generative inference or remote page fetching."""
+"""Persistent first-page text, FTS5 search and exact bulk selections."""
 import asyncio
 import base64
 import csv
@@ -8,7 +8,7 @@ import json
 import re
 import secrets
 import sqlite3
-import struct
+import time
 from collections import defaultdict
 from functools import wraps
 from pathlib import Path
@@ -17,12 +17,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.context import Context
 from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 from pydantic import Field
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.feature_extraction.text import TfidfVectorizer
 
-from fast_tabber.semantic import cluster_vectors, cosine, embed_texts, embedding_digest
 from fast_tabber.onboarding import DISCLOSURE
 
 
@@ -38,7 +36,7 @@ class Library:
         self.tasks = {}
         with store.lock, store.db:
             store.db.execute("CREATE TABLE IF NOT EXISTS resources (kind TEXT,id TEXT,metadata TEXT,fingerprint TEXT,document TEXT,level INTEGER,vector BLOB,model TEXT,PRIMARY KEY(kind,id))")
-            store.db.execute("CREATE TABLE IF NOT EXISTS grouping_plans (id TEXT PRIMARY KEY,payload TEXT)")
+            store.db.execute("CREATE TABLE IF NOT EXISTS selections (id TEXT PRIMARY KEY,kind TEXT NOT NULL,items TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
             store.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(kind UNINDEXED,id UNINDEXED,title,url,content)")
 
     def permission(self, kind, confirm=False, ids=None):
@@ -46,6 +44,7 @@ class Library:
         settings = json.loads(path.read_text()) if path.exists() else {}
         if not settings.get("privacy_acknowledged"):
             return {"requiresDisclosure": True, "disclosure": DISCLOSURE, "started": False,
+                    "nextAction": "ask_user", "waitingFor": "user",
                     "nextStep": "Show the disclosure once and acknowledge it through onboarding before indexing."}
         allowed = settings.get("indexing_allowed", [])
         if kind not in allowed:
@@ -54,7 +53,9 @@ class Library:
                 return None
             if not confirm:
                 return {"requiresIndexingConsent": True, "resource": kind, "started": False,
-                        "message": "Allow a persistent local index of this resource? Deeper text/image inspection occurs only on demand."}
+                        "noChangesMade": True, "nextAction": "ask_user", "waitingFor": "user",
+                        "message": f"May Fast-Tabber create/reuse a persistent local index of the selected {kind}? Page text is stored once and reused across operations.",
+                        "nextStep": "Ask the user for indexing permission and wait. Set confirm_index=true only after explicit approval; a grouping request or unrelated ok is not indexing consent."}
             if ids is None:
                 settings["indexing_allowed"] = [*allowed, kind]
             else:
@@ -112,121 +113,239 @@ class Library:
     def fingerprint(row):
         return hashlib.sha256(json.dumps([row.get("url"), row.get("title", "")], ensure_ascii=False).encode()).hexdigest()
 
-    async def index(self, kind, ids=None, level="metadata", confirm=False, refresh=False):
+
+    @staticmethod
+    def has_page_text(row, page):
+        text = page.get("text", "")
+        if text.startswith("Website: "):
+            text = text.split("\n", 2)[-1]
+        return bool(text.strip() and text.strip() != row["url"])
+
+    def progress(self, job, stage, **values):
+        if job is None:
+            return
+        if self.store.get_job(job["id"])["state"] == "cancel_requested":
+            raise asyncio.CancelledError
+        job.update(stage=stage, updatedAt=time.time(), **values)
+        self.store.save_job(job)
+
+    async def index(self, kind, ids=None, level="text", confirm=False, refresh=False, job=None):
         permission = self.permission(kind, confirm, ids)
         if permission:
             return permission
         async with self.lock:
-            all_rows = await self.records(kind, ids, expand=True)
-            rows = self.web(all_rows)
-            digest = await embedding_digest(self.state)
-            model = digest + ":clustering-v1"
-            requested = {"metadata": 0, "text": 1, "image": 2}[level]
-            reused, changed, embedded, embedding_inputs = 0, 0, 0, 0
-            for offset in range(0, len(rows), 50):
-                prepared = []
-                for row in rows[offset:offset + 50]:
-                    previous = self.cached(kind, row["id"])
-                    fingerprint = self.fingerprint(row)
-                    if not refresh and previous and previous[1] == fingerprint and previous[3] >= requested and previous[5] == model:
-                        with self.store.lock, self.store.db:
-                            self.store.db.execute("UPDATE resources SET metadata=? WHERE kind=? AND id=?", (json.dumps(row), kind, row["id"]))
-                        reused += 1
-                        continue
-                    page = {"id": row["id"], "windowId": row.get("windowId", 0), "url": row["url"],
-                            "title": row.get("title", ""), "headings": [], "text": row["url"]}
-                    cached = self.store.index.cached_page(page) if not refresh else None
-                    if cached and requested >= 1 and not (previous and previous[3] >= 1) and cached["text"] == row["url"]:
-                        cached = None
-                    actual_level = requested
-                    if cached:
-                        page.update(headings=cached["headings"], text=cached["text"].split("\nVisual evidence:")[0])
-                        actual_level = max(requested, previous[3] if previous else 1 if cached["text"] != row["url"] else 0)
-                        if cached.get("image_id"):
-                            page["image_id"] = cached["image_id"]
-                        document = self.store.index.document(page)[0]
-                    if requested == 1 and (refresh or not cached):
-                        arguments = {"tabId": int(row["id"])} if kind == "tabs" else {"bookmarkId": row["id"]}
+            rows = self.web(await self.records(kind, ids, expand=True))
+            requested = {"metadata": 0, "text": 1}[level]
+            changed = reused = 0
+            failed = []
+            total = len(rows)
+
+            async def prepare(row):
+                previous = self.cached(kind, row["id"])
+                page = {"id": row["id"], "windowId": row.get("windowId", 0), "url": row["url"],
+                        "title": row.get("title", ""), "headings": [], "text": ""}
+                cached = self.store.index.cached_page(page) if not refresh else None
+                if cached and (requested == 0 or self.has_page_text(row, cached)):
+                    page.update(headings=cached["headings"], text=cached["text"])
+                    if cached.get("image_id"):
+                        page["image_id"] = cached["image_id"]
+                    return row, page, max(requested, 1 if page["text"] else 0), True, None
+                if not refresh and previous and previous[1] == self.fingerprint(row) and previous[3] >= requested:
+                    document = self.store.db.execute("SELECT headings,content FROM documents WHERE id=?", (previous[2],)).fetchone()
+                    if document:
+                        page.update(headings=json.loads(document[0]), text=document[1])
+                        return row, page, previous[3], True, None
+                if requested:
+                    arguments = {"tabId": int(row["id"])} if kind == "tabs" else {"bookmarkId": row["id"]}
+                    try:
                         evidence = await self.bridge.call("inspect_page", {**arguments, "detail": "text"})
                         if kind == "tabs" and evidence["url"] != row["url"]:
-                            raise RuntimeError("A tab navigated during extraction; no grouping was performed")
-                        page.update(title=evidence["title"], headings=evidence["headings"], text=evidence["text"])
-                    document = self.store.index.document(page)[0]
-                    if requested == 2:
-                        image_keys = [key for key in self.store.index.artifacts(document) if self.store.db.execute("SELECT kind FROM artifacts WHERE id=?", (key,)).fetchone()[0] == "image"]
-                        if refresh or not image_keys:
-                            arguments = {"tabId": int(row["id"])} if kind == "tabs" else {"bookmarkId": row["id"]}
-                            capture = await self.bridge.call("inspect_page", {**arguments, "detail": "image"})
-                            if kind == "tabs" and capture["url"] != row["url"]:
-                                raise RuntimeError("A tab navigated during screenshot capture")
-                            page["image_id"] = self.store.index.image(capture["image"])
-                            page.update(title=capture["title"], headings=capture.get("headings", []), text=capture.get("text", ""))
-                            document = self.store.index.document(page)[0]
-                    prepared.append((row, fingerprint, page, document, actual_level))
-                keys = {document: self.store.index.artifacts(document) for _, _, _, document, _ in prepared}
-                pending = self.store.index.pending([key for values in keys.values() for key in values], model)
-                computed = {key for key, _ in pending}
-                embedding_inputs += len(pending)
-                embedded += sum(any(key in computed for key in keys[document]) for _, _, _, document, _ in prepared)
-                for start in range(0, len(pending), 16):
-                    batch = pending[start:start + 16]
-                    inputs = ["task: clustering | query: " + value if isinstance(value, str) else value for _, value in batch]
-                    vectors, actual = await embed_texts(inputs, self.state, digest)
-                    if actual != digest:
-                        raise RuntimeError("Embedding model changed during indexing")
-                    self.store.index.save_vectors([key for key, _ in batch], vectors, model)
-                with self.store.lock, self.store.db:
-                    for row, fingerprint, page, document, actual_level in prepared:
-                        vector = self.store.index.page_vector(keys[document], model)
-                        packed = struct.pack(f"<{len(vector)}e", *vector)
-                        self.store.db.execute("INSERT OR REPLACE INTO resources VALUES (?,?,?,?,?,?,?,?)",
-                            (kind, row["id"], json.dumps(row), fingerprint, document, actual_level, packed, model))
-                        self.store.db.execute("DELETE FROM resources_fts WHERE kind=? AND id=?", (kind, row["id"]))
-                        self.store.db.execute("INSERT INTO resources_fts VALUES (?,?,?,?,?)", (kind, row["id"], page["title"], row["url"], page["text"]))
-                changed += len(prepared)
-            return {"resource": kind, "indexed": changed, "reused": reused, "total": len(rows), "level": level,
-                    "embedded": embedded, "embeddingInputs": embedding_inputs,
-                    "skipped": sum(bool(row.get("url")) and row not in rows for row in all_rows),
-                    "model": model, "verified": True}
+                            raise ValueError("tab_navigated_during_extraction")
+                        page.update(headings=evidence["headings"], text=evidence["text"])
+                    except (RuntimeError, ValueError) as error:
+                        return row, page, requested, False, str(error)[:200]
+                return row, page, requested, False, None
 
-    async def search(self, kind, query, offset, limit, mode="hybrid"):
+            for offset in range(0, total, 8):
+                tasks = [asyncio.create_task(prepare(row)) for row in rows[offset:offset + 8]]
+                self.progress(job, "extracting_text" if requested else "indexing", inFlight=len(tasks))
+                finished = 0
+                try:
+                    for task in asyncio.as_completed(tasks):
+                        row, page, actual_level, cached, error = await task
+                        finished += 1
+                        if error:
+                            failed.append({"id": row["id"], "stage": "extracting_text", "reason": error})
+                        else:
+                            document = self.store.index.document(page)[0]
+                            with self.store.lock, self.store.db:
+                                self.store.db.execute("INSERT OR REPLACE INTO resources VALUES (?,?,?,?,?,?,?,?)",
+                                    (kind, row["id"], json.dumps(row), self.fingerprint(row), document, actual_level, None, None))
+                                self.store.db.execute("DELETE FROM resources_fts WHERE kind=? AND id=?", (kind, row["id"]))
+                                self.store.db.execute("INSERT INTO resources_fts VALUES (?,?,?,?,?)",
+                                    (kind, row["id"], page["title"], row["url"], " ".join(page["headings"]) + "\n" + page["text"]))
+                            reused += int(cached)
+                            changed += int(not cached)
+                        self.progress(job, "extracting_text" if requested else "indexing", currentResource=row["id"],
+                            completed=changed, indexed=changed, cached=reused, reused=reused, failed=len(failed),
+                            extracted=changed if requested else 0, extractionFailed=len(failed),
+                            failedResources=failed[:20], pending=total - changed - reused - len(failed), inFlight=len(tasks) - finished)
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            return {"resource": kind, "indexed": changed, "completed": changed, "reused": reused, "cached": reused,
+                    "failed": len(failed), "failures": failed[:20], "pending": 0, "total": total, "level": level, "verified": True}
+
+    async def search(self, kind, query, offset, limit):
         rows = self.web(await self.records(kind))
         live = {row["id"]: row for row in rows}
-        valid = {identifier for identifier, fingerprint in self.store.db.execute("SELECT id,fingerprint FROM resources WHERE kind=?", (kind,))
-                 if identifier in live and fingerprint == self.fingerprint(live[identifier])}
-        scores = []
-        if mode != "keyword":
-            digest = await embedding_digest(self.state)
-            vectors, _ = await embed_texts(["task: clustering | query: " + query], self.state, digest)
-            for identifier, raw in self.store.db.execute("SELECT id,vector FROM resources WHERE kind=? AND model=?", (kind, digest + ":clustering-v1")):
-                if identifier in valid:
-                    scores.append((identifier, cosine(vectors[0], struct.unpack(f"<{len(raw)//2}e", raw))))
-        ranks = defaultdict(float)
-        for rank, (identifier, _) in enumerate(sorted(scores, key=lambda item: -item[1])):
-            ranks[identifier] += 1 / (60 + rank)
         words = re.findall(r"\w+", query, flags=re.UNICODE)[:20]
-        if words and mode != "semantic":
-            match = (" AND " if mode == "keyword" else " OR ").join('"' + word + '"' for word in words)
-            for rank, (identifier,) in enumerate(self.store.db.execute("SELECT id FROM resources_fts WHERE resources_fts MATCH ? AND kind=? ORDER BY rank", (match, kind))):
-                if identifier in valid:
-                    ranks[identifier] += 1 / (60 + rank)
-        if not ranks and mode != "keyword":
-            raise ValueError("No indexed resources are available; index the explicitly requested resource first")
-        ordered = sorted(ranks, key=ranks.get, reverse=True)
-        items = []
-        for key in ordered[offset:offset+limit]:
-            item = self.compact(live[key])
-            row = self.store.db.execute("SELECT d.content FROM documents d JOIN resources r ON d.id=r.document WHERE r.kind=? AND r.id=?", (kind, key)).fetchone()
-            text = row[0] if row else ""
-            start = next((max(0, text.casefold().find(word.casefold()) - 60) for word in words if word.casefold() in text.casefold()), 0)
-            item.update(snippet=text[start:start+300], origin=urlsplit(live[key]["url"]).netloc)
-            items.append(item)
-        return {"total": len(ordered), "offset": offset, "method": mode, "ranking": "Candidates, not guaranteed semantic matches",
-                "items": items}
+        if not words:
+            raise ValueError("query must contain searchable words")
+        match = " AND ".join('"' + word + '"' for word in words)
+        with self.store.lock:
+            hits = self.store.db.execute("SELECT f.id,snippet(resources_fts,4,'','',' ... ',32),r.fingerprint "
+                "FROM resources_fts f JOIN resources r ON f.kind=r.kind AND f.id=r.id "
+                "WHERE resources_fts MATCH ? AND f.kind=? ORDER BY bm25(resources_fts)", (match, kind)).fetchall()
+        snippets = {identifier: snippet for identifier, snippet, fingerprint in hits
+                    if identifier in live and fingerprint == self.fingerprint(live[identifier])}
+        ordered = list(snippets)
+        for row in rows:
+            metadata = " ".join(str(row.get(key, "")) for key in ("title", "url", "folder", "groupTitle")).casefold()
+            if row["id"] not in snippets and all(word.casefold() in metadata for word in words):
+                ordered.append(row["id"])
+        items = [{**self.compact(live[key], True), "snippet": snippets.get(key, "")[:300]} for key in ordered[offset:offset + limit]]
+        return {"total": len(ordered), "offset": offset, "returned": len(items), "hasMore": offset + len(items) < len(ordered),
+                "nextOffset": offset + len(items) if offset + len(items) < len(ordered) else None,
+                "method": "fts5_bm25", "items": items}
+
+    async def selection(self, action, kind, ids=None, query="", selection_ids=None, operation="union", selection_id="", offset=0, limit=20):
+        if action == "create":
+            if ids is not None and query:
+                raise ValueError("Provide exact resource IDs or a search query, not both")
+            if query:
+                result = await self.search(kind, query, 0, 5001)
+                selected = [item["id"] for item in result["items"]]
+                if result["total"] > 5000:
+                    raise ValueError("Search selection exceeds 5000 matches; refine the query")
+            else:
+                selected = list(dict.fromkeys(map(str, ids))) if ids is not None else [row["id"] for row in self.web(await self.records(kind))]
+            if not selected or len(selected) > 5000:
+                raise ValueError("Selection needs 1 to 5000 matching resources")
+            rows = await self.records(kind, selected)
+            items = [{"id": row["id"], "fingerprint": self.fingerprint(row)} for row in rows]
+            identifier = "sel_" + secrets.token_hex(8)
+            with self.store.lock, self.store.db:
+                self.store.db.execute("INSERT INTO selections(id,kind,items) VALUES (?,?,?)", (identifier, kind, json.dumps(items)))
+            return {"selection_id": identifier, "resource": kind, "count": len(items), "examples": [self.compact(row) for row in rows[:5]]}
+        if action == "combine":
+            if operation not in {"union", "intersect", "exclude"} or not selection_ids or len(selection_ids) < 2:
+                raise ValueError("Combine needs at least two selections and union, intersect, or exclude")
+            values = [self.get_selection(identifier, kind) for identifier in selection_ids]
+            sets = [{item["id"]: item for item in value} for value in values]
+            if operation == "union":
+                combined = {key: item for group in sets for key, item in group.items()}
+            elif operation == "intersect":
+                combined = {key: item for key, item in sets[0].items() if all(key in group for group in sets[1:])}
+            else:
+                combined = {key: item for key, item in sets[0].items() if all(key not in group for group in sets[1:])}
+            if not combined:
+                raise ValueError("Combined selection is empty")
+            if len(combined) > 5000:
+                raise ValueError("Combined selection exceeds 5000 resources; refine it first")
+            identifier = "sel_" + secrets.token_hex(8)
+            with self.store.lock, self.store.db:
+                self.store.db.execute("INSERT INTO selections(id,kind,items) VALUES (?,?,?)", (identifier, kind, json.dumps(list(combined.values()))))
+            return {"selection_id": identifier, "resource": kind, "count": len(combined), "operation": operation}
+        if action == "show":
+            rows = await self.current_selection(kind, selection_id)
+            return {"selection_id": selection_id, "resource": kind, "total": len(rows), "offset": offset,
+                    "returned": len(rows[offset:offset+limit]), "hasMore": offset + limit < len(rows),
+                    "nextOffset": offset + limit if offset + limit < len(rows) else None,
+                    "items": [self.compact(row) for row in rows[offset:offset+limit]]}
+        raise ValueError("Unsupported selection action")
+
+    def get_selection(self, identifier, kind):
+        with self.store.lock:
+            row = self.store.db.execute("SELECT kind,items FROM selections WHERE id=?", (identifier,)).fetchone()
+        if not row or row[0] != kind:
+            raise ValueError("Selection not found for this resource type")
+        return json.loads(row[1])
+
+    async def current_selection(self, kind, identifier):
+        items = self.get_selection(identifier, kind)
+        rows = await self.records(kind, [item["id"] for item in items])
+        current = {row["id"]: row for row in rows}
+        if any(self.fingerprint(current[item["id"]]) != item["fingerprint"] for item in items):
+            raise ValueError("A selected resource changed; refresh the selection before mutating")
+        return rows
+
+    async def assign_selections(self, kind, assignments, parent_id=None, target_group_id=None):
+        if not assignments or len(assignments) > 100:
+            raise ValueError("Provide 1 to 100 named selection assignments")
+        if target_group_id is not None and kind != "tabs":
+            raise ValueError("A Chrome group target is valid only for tabs")
+        if parent_id is not None and kind != "bookmarks":
+            raise ValueError("A bookmark parent folder is valid only for bookmarks")
+        selected, categories = {}, []
+        for assignment in assignments:
+            if set(assignment) != {"selection_id", "title"}:
+                raise ValueError("Each assignment must contain exactly selection_id and title")
+            title = assignment.get("title", "").strip()
+            if not title or len(title) > 80:
+                raise ValueError("Every assignment needs a title of at most 80 characters")
+            items = self.get_selection(assignment.get("selection_id", ""), kind)
+            category_ids = []
+            for item in items:
+                if item["id"] in selected:
+                    raise ValueError("Selections overlap; refine them before assigning to avoid ambiguity")
+                selected[item["id"]] = item["fingerprint"]
+                category_ids.append(item["id"])
+            if not category_ids:
+                raise ValueError("Cannot assign an empty selection")
+            categories.append({"title": title, "ids": category_ids})
+        if len(selected) > 5000:
+            raise ValueError("Assignments exceed 5000 resources; narrow the selections")
+        current = {row["id"]: row for row in await self.records(kind, list(selected))}
+        if any(self.fingerprint(current[key]) != fingerprint for key, fingerprint in selected.items()):
+            raise ValueError("A selected resource changed; refresh the selection before mutating")
+        if len(self.web(list(current.values()))) != len(current):
+            raise ValueError("Only ordinary HTTP/HTTPS resources can be grouped")
+        if kind == "tabs":
+            if target_group_id is not None:
+                if len(assignments) != 1 or len({row["windowId"] for row in current.values()}) != 1:
+                    raise ValueError("Moving to an existing Chrome group needs one selection from its single window")
+                group_tabs = await self.bridge.call("capture_browser")
+                group = next((row for row in group_tabs.get("tabs", []) if row.get("groupId") == target_group_id), None)
+                if not group or group.get("windowId") not in {row["windowId"] for row in current.values()}:
+                    raise ValueError("Target Chrome group is missing or belongs to another window")
+                result = await self.mutate("group_action", {"action": "add", "groupId": target_group_id,
+                    "tabIds": [int(key) for key in current]})
+                return {**result, "resource": kind, "selectionCount": len(selected), "verified": True}
+            expected = {key: current[key]["url"] for key in selected}
+            groups = []
+            for category in categories:
+                windows = defaultdict(list)
+                for key in category["ids"]:
+                    windows[current[key]["windowId"]].append(int(key))
+                groups.extend({"title": category["title"], "tabIds": values} for values in windows.values())
+            if len(groups) > 100:
+                raise ValueError("Assignments would create more than 100 native groups; narrow the selection")
+            result = await self.mutate("group_categories", {"categories": groups, "mode": "batch", "expectedUrls": expected})
+        else:
+            if parent_id is None:
+                roots = [row for row in (await self.bridge.call("bookmark_tree"))["nodes"] if row.get("parentId") == "0" and not row.get("managed")]
+                if not roots:
+                    raise ValueError("No writable bookmark root is available")
+                parent_id = roots[0]["id"]
+            result = await self.mutate("bookmark_action", {"action": "group", "parentId": parent_id, "groups": categories})
+        return {**result, "resource": kind, "selectionCount": len(selected), "verified": True}
 
     @staticmethod
     def compact(row, urls=False):
-        result = {key: row[key] for key in ("id", "title", "parentId", "folder", "windowId", "groupId", "groupTitle", "index") if key in row}
+        result = {key: row[key] for key in ("id", "title", "parentId", "folder", "windowId", "groupId", "groupTitle", "index", "discarded", "status") if key in row}
         if row.get("kind") == "bookmarks":
             result["type"] = "bookmark" if row.get("url") else "folder"
             result["managed"] = row.get("managed", False)
@@ -234,159 +353,95 @@ class Library:
             result["url"] = row["url"]
         return result
 
-    def label(self, members):
-        titles = [row.get("title", "") for row in members]
-        if len(members) == 1 and titles[0].strip():
-            return titles[0].strip()[:80]
-        try:
-            vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=1000,
-                                       token_pattern=r"(?u)\b[^\W\d_][\w-]+\b")
-            matrix = vectorizer.fit_transform(titles)
-            weights = matrix.mean(axis=0).A1
-            return str(vectorizer.get_feature_names_out()[int(weights.argmax())]).title()[:80]
-        except ValueError:
-            return (urlsplit(members[0]["url"]).hostname or "Related pages")[:80]
 
-    async def propose(self, kind, ids, categories, max_groups, instruction, confirm):
-        result = await self.index(kind, ids, confirm=confirm)
-        if result.get("started") is False:
-            return result
-        rows = self.web(await self.records(kind, ids, expand=True))
-        if not rows:
-            raise ValueError("No ordinary web resources selected")
-        if len(rows) > 5000:
-            raise ValueError("Group at most 5000 resources per operation")
-        vectors = []
-        for row in rows:
-            cached = self.cached(kind, row["id"])
-            vectors.append(list(struct.unpack(f"<{len(cached[4])//2}e", cached[4])))
-        grouped = defaultdict(list)
-        if categories:
-            category_vectors, _ = await embed_texts(["task: clustering | query: " + value for value in categories], self.state)
-            for row, vector in zip(rows, vectors):
-                similarities = sorted([(cosine(vector, other), title) for title, other in zip(categories, category_vectors)], reverse=True)
-                if similarities[0][0] < 0.4 or len(similarities) > 1 and similarities[0][0] - similarities[1][0] < 0.025:
-                    continue
-                grouped[similarities[0][1]].append(row)
-        else:
-            labels = (AgglomerativeClustering(n_clusters=min(max_groups, len(rows)), metric="cosine", linkage="average").fit_predict(vectors).tolist()
-                      if max_groups and len(rows) > 1 else cluster_vectors(vectors))
-            for row, cluster in zip(rows, labels):
-                if cluster >= 0:
-                    grouped[str(cluster)].append(row)
-        groups = []
-        used = set()
-        for title, members in grouped.items():
-            label = title if categories else self.label(members)
-            if label in used:
-                label = f"{label} {len(groups)+1}"
-            used.add(label)
-            groups.append({"id": str(len(groups)+1), "title": label, "ids": [row["id"] for row in members]})
-        plan = {"id": secrets.token_hex(8), "resource": kind, "instruction": instruction, "groups": groups,
-                "selection": rows, "state": "ready", "unclassified": len(rows) - sum(len(group["ids"]) for group in groups)}
-        with self.store.lock, self.store.db:
-            self.store.db.execute("INSERT INTO grouping_plans VALUES (?,?)", (plan["id"], json.dumps(plan)))
-        return self.show_plan(plan)
+    async def pending_job(self):
+        for identifier, task in self.tasks.items():
+            if not task.done():
+                job = self.store.get_job(identifier)
+                return {**await self.job("status", job["resource"], None, job["level"], False, identifier),
+                        "requestStarted": False, "message": "Another local job is still working. Follow its nextCall; do not start a duplicate."}
 
-    def plan(self, identifier):
-        row = self.store.db.execute("SELECT payload FROM grouping_plans WHERE id=?", (identifier,)).fetchone()
-        if not row:
-            raise ValueError("Grouping plan not found")
-        return json.loads(row[0])
-
-    def show_plan(self, plan, offset=0, limit=20):
-        rows = {row["id"]: row for row in plan["selection"]}
-        return {"planId": plan["id"], "resource": plan["resource"], "state": plan["state"], "applied": plan["state"] == "applied",
-                "proposalOnly": plan["state"] == "ready", "nextStep": "Agent reviews selected evidence, then apply_grouping(plan_id, names) to make actual browser changes.", "groupCount": len(plan["groups"]),
-                "unclassified": plan["unclassified"], "offset": offset, "groups": [{"planGroupId": group["id"], "title": group["title"],
-                "count": len(group["ids"]), "examples": [self.compact(rows[key]) for key in group["ids"][:3]]} for group in plan["groups"][offset:offset+limit]]}
-
-    async def apply(self, plan, parent_id=None):
-        if plan["state"] != "ready":
-            raise ValueError("This plan was already applied or needs reconciliation; do not retry it blindly")
-        current = {row["id"]: row for row in await self.records(plan["resource"], [row["id"] for row in plan["selection"]])}
-        if any(self.fingerprint(row) != self.fingerprint(current[row["id"]]) for row in plan["selection"]):
-            raise ValueError("A selected title or URL changed; generate a new plan on demand")
-        if not plan["groups"]:
-            return {"grouped": 0, "unclassified": plan["unclassified"], "verified": True}
-        # Persist uncertain state before any browser mutation.
-        plan["state"] = "applying"
-        self.save_plan(plan)
-        if plan["resource"] == "tabs":
-            groups = []
-            for group in plan["groups"]:
-                windows = defaultdict(list)
-                for key in group["ids"]:
-                    windows[current[key]["windowId"]].append(int(key))
-                groups.extend({"title": group["title"], "tabIds": values} for values in windows.values())
-            result = await self.mutate("group_categories", {"categories": groups, "mode": "batch",
-                "expectedUrls": {key: row["url"] for key, row in current.items()}})
-        else:
-            if parent_id is None:
-                roots = [row for row in (await self.bridge.call("bookmark_tree"))["nodes"] if row.get("parentId") == "0" and not row.get("managed")]
-                if not roots:
-                    raise ValueError("No writable bookmark root is available")
-                parent_id = roots[0]["id"]
-            result = await self.mutate("bookmark_action", {"action": "group", "parentId": parent_id,
-                "groups": [{"title": group["title"], "ids": group["ids"]} for group in plan["groups"]]})
-        plan["state"] = "applied"
-        self.save_plan(plan)
-        return {**result, "resource": plan["resource"], "unclassified": plan["unclassified"],
-                "names": [group["title"] for group in plan["groups"][:20]], "verified": True}
-
-    def save_plan(self, plan):
-        with self.store.lock, self.store.db:
-            self.store.db.execute("UPDATE grouping_plans SET payload=? WHERE id=?", (json.dumps(plan), plan["id"]))
 
     async def job(self, action, resource, ids, level, confirm, job_id="", refresh=False):
         if action == "start":
             permission = self.permission(resource, confirm, ids)
             if permission:
                 return permission
-            if any(not task.done() for task in self.tasks.values()):
-                raise ValueError("An indexing job is already running")
+            pending = await self.pending_job()
+            if pending:
+                return pending
             records = self.web(await self.records(resource, ids, expand=True))
-            job = {"id": secrets.token_hex(8), "resource": resource, "level": level, "items": [row["id"] for row in records], "completed": 0, "state": "running", "refresh": refresh}
+            pending = await self.pending_job()
+            if pending:
+                return pending
+            job = {"id": secrets.token_hex(8), "resource": resource, "level": level, "items": [row["id"] for row in records],
+                   "total": len(records), "completed": 0, "cached": 0, "reused": 0, "failed": 0,
+                   "extracted": 0, "extractionFailed": 0, "inFlight": 0,
+                   "pending": len(records), "failedResources": [], "state": "running", "stage": "validating", "refresh": refresh,
+                   "noBrowserChanges": True, "startedAt": time.time(), "updatedAt": time.time()}
             self.store.save_job(job)
             self.tasks[job["id"]] = asyncio.create_task(self.run_job(job))
         else:
             job = self.store.get_job(job_id)
+            if job.get("resource") not in {None, resource}:
+                raise ValueError("This job belongs to another resource type")
             active = job["id"] in self.tasks and not self.tasks[job["id"]].done()
             if action == "cancel":
-                job["state"] = "cancel_requested" if active else "cancelled"
+                if job.get("stage") == "grouping" and active:
+                    raise ValueError("Chrome mutation is in progress; wait for its verified result before undoing")
+                if active:
+                    job["state"] = "cancel_requested"
+                elif job["state"] in {"running", "cancel_requested"}:
+                    job["state"] = "interrupted"
                 self.store.save_job(job)
             elif action == "resume":
-                if active or "resource" not in job:
+                if active or "resource" not in job or job.get("type") == "grouping":
                     raise ValueError("Job is active or predates this index format")
+                # Revisit the original scope; committed representations are reused by index().
+                job.update(total=len(job["items"]), completed=0, cached=0, reused=0, indexed=0, failed=0,
+                           extracted=0, extractionFailed=0, inFlight=0, pending=len(job["items"]), failedResources=[])
                 job["state"] = "running"
+                job.update(stage="validating", startedAt=time.time(), updatedAt=time.time())
+                job.pop("error", None)
+                job.pop("errorStage", None)
+                job.pop("result", None)
                 self.store.save_job(job)
                 self.tasks[job["id"]] = asyncio.create_task(self.run_job(job))
             elif not active and job["state"] in {"running", "cancel_requested"}:
                 job["state"] = "interrupted"
                 self.store.save_job(job)
-        return {key: job.get(key) for key in ("id", "state", "resource", "level", "completed", "error")} | {"total": len(job["items"])}
+        result = {key: job[key] for key in ("id", "type", "state", "resource", "mode", "level", "stage", "completed", "cached", "reused", "indexed", "failed", "failedResources", "pending", "extracted", "extractionFailed", "inFlight", "currentResource", "error", "errorStage", "noBrowserChanges", "result") if key in job} | {"total": job.get("total", len(job["items"]))}
+        if "startedAt" in job:
+            endpoint = time.time() if job["state"] in {"running", "cancel_requested"} else job.get("updatedAt", time.time())
+            result.update(elapsedSeconds=max(0, int(endpoint - job["startedAt"])),
+                          secondsSinceProgress=max(0, int(time.time() - job.get("updatedAt", job["startedAt"]))))
+        if job["state"] in {"running", "cancel_requested"}:
+            result.update(nextAction="poll", waitingFor=job.get("stage", "local processing"),
+                          nextCall={"tool": "index_resources",
+                                    "arguments": {"action": "status", "resource": job["resource"], "job_id": job["id"], "wait_seconds": 5}})
+        else:
+            result["nextAction"] = "continue" if job["state"] == "complete" else "stop"
+        return result
 
     async def run_job(self, job):
         try:
-            for offset in range(job["completed"], len(job["items"]), 50):
-                if self.store.get_job(job["id"])["state"] == "cancel_requested":
-                    job["state"] = "cancelled"
-                    break
-                result = await self.index(job["resource"], job["items"][offset:offset+50], job["level"], confirm=True, refresh=job.get("refresh", False))
-                if not result.get("verified"):
-                    raise RuntimeError("Indexing prerequisites changed; inspect setup/consent before resuming")
-                job["completed"] = min(offset + 50, len(job["items"]))
-                self.store.save_job(job)
-                await asyncio.sleep(0)
-            else:
-                job["state"] = "complete"
+            result = await self.index(job["resource"], job["items"], job["level"], confirm=False, refresh=job.get("refresh", False), job=job)
+            if not result.get("verified"):
+                raise RuntimeError("Indexing prerequisites changed; inspect setup/consent before resuming")
+            job["result"] = {key: result[key] for key in ("indexed", "reused", "failed", "failures", "pending", "total", "level")}
+            job.update(state="complete", stage="complete_with_failures" if job.get("failed") else "complete")
+        except asyncio.CancelledError:
+            job.update(state="cancelled", stage="cancelled")
         except Exception as error:
-            job.update(state="failed", error=str(error)[:500])
+            job.update(state="failed", error=str(error)[:500], errorStage=job.get("stage"), noBrowserChanges=True,
+                       pending=max(0, job.get("total", len(job["items"])) - job.get("completed", 0) - job.get("cached", 0) - job.get("failed", 0)))
+        job["updatedAt"] = time.time()
         self.store.save_job(job)
 
 
 def register_library_tools(mcp, library):
     Kind = Literal["tabs", "bookmarks"]
+    ResourceID = str | int
     Limit = Annotated[int, Field(ge=1, le=100)]
     Offset = Annotated[int, Field(ge=0)]
 
@@ -401,134 +456,135 @@ def register_library_tools(mcp, library):
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False))
     @errors
-    async def list_resources(resource: Kind, query: str = "", ids: list[str] | None = None,
-                             offset: Offset = 0, limit: Limit = 20, include_urls: bool = False) -> dict[str, Any]:
+    async def list_resources(resource: Kind, query: str = "", ids: list[ResourceID] | None = None,
+                             offset: Offset = 0, limit: Limit = 20, include_urls: bool = True, group_id: int | None = None) -> dict[str, Any]:
         """List/filter tabs OR explicitly requested bookmarks. Bounded metadata, URLs only when requested. Folders are included for bookmarks."""
+        ids = list(dict.fromkeys(map(str, ids))) if ids is not None else None
         rows = await library.records(resource, ids)
+        if group_id is not None:
+            if resource != "tabs":
+                raise ValueError("group_id is valid only for tabs")
+            rows = [row for row in rows if row.get("groupId") == group_id]
         words = query.casefold().split()
         rows = [row for row in rows if all(word in " ".join(str(row.get(key, "")) for key in ("title", "url", "folder", "groupTitle")).casefold() for word in words)]
-        return {"resource": resource, "total": len(rows), "offset": offset,
+        return {"resource": resource, "total": len(rows), "offset": offset, "returned": len(rows[offset:offset+limit]),
+                "hasMore": offset + limit < len(rows), "nextOffset": offset + limit if offset + limit < len(rows) else None,
                 "items": [library.compact(row, include_urls) for row in rows[offset:offset+limit]]}
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False))
     @errors
-    async def index_resources(resource: Kind, action: Literal["start", "status", "resume", "cancel"] = "start",
-                              ids: list[str] | None = None, level: Literal["metadata", "text", "image"] = "metadata",
-                              confirm_index: bool = False, job_id: str = "", wait_seconds: Annotated[int, Field(ge=0, le=30)] = 0,
-                              refresh: bool = False) -> dict[str, Any]:
-        """On-demand persistent indexing. Start with metadata; request text/images only as needed. Bookmarks require explicit scope and indexing permission. Checkpoints every 50."""
+    async def index_resources(ctx: Context, resource: Kind, action: Literal["start", "status", "resume", "cancel"] = "start",
+                              ids: list[ResourceID] | None = None, level: Literal["metadata", "text"] = "text",
+                              confirm_index: Annotated[bool, Field(description="True only after explicit user approval for this scope; do not infer from a grouping request or unrelated ok")] = False, job_id: str = "", wait_seconds: Annotated[int, Field(ge=0, le=30)] = 0,
+                              refresh: bool = False, group_id: int | None = None) -> dict[str, Any]:
+        """Create/reuse a LOCAL index only after explicit user permission. Never self-authorize confirm_index. Poll running jobs using nextCall until complete/failed; do not finish by promising to poll later. ids omitted means all eligible resources, not the first list page."""
+        if action != "start" and library.store.get_job(job_id).get("type") == "grouping":
+            raise ValueError("Legacy grouping jobs cannot be resumed; indexing never applies grouping")
+        ids = list(dict.fromkeys(map(str, ids))) if ids is not None else None
+        if group_id is not None:
+            if resource != "tabs":
+                raise ValueError("group_id is valid only for tabs")
+            ids = [row["id"] for row in await library.records(resource, ids) if row.get("groupId") == group_id]
         result = await library.job(action, resource, ids, level, confirm_index, job_id, refresh)
+        last_progress = None
+        progress_step = 0
         if action == "status" and result.get("state") in {"running", "cancel_requested"}:
             for _ in range(wait_seconds * 2):
                 await asyncio.sleep(.5)
                 result = await library.job("status", resource, None, level, False, result["id"])
+                marker = (result.get("stage"), result.get("completed"), result.get("cached"), result.get("failed"),
+                          result.get("extracted"), result.get("extractionFailed"), result.get("currentResource"))
+                if marker != last_progress:
+                    progress_step += 1
+                    await ctx.report_progress(progress_step, None,
+                                              f"{result.get('stage')}: {result.get('extracted', 0)} extracted, {result.get('extractionFailed', 0)} extraction failures, {result.get('inFlight', 0)} in flight, {result.get('completed', 0)} indexed, {result.get('cached', 0)} cached, {result.get('failed', 0)} failed, {result.get('pending', 0)} pending")
+                    last_progress = marker
                 if result["state"] not in {"running", "cancel_requested"}:
                     break
+        if result.get("state") in {"running", "cancel_requested"}:
+            result.setdefault("nextAction", "poll")
+            result.setdefault("nextCall", {"tool": "index_resources", "arguments": {"action": "status", "resource": result["resource"], "job_id": result["id"], "wait_seconds": 5}})
+            result["nextStep"] = "Briefly report stage, extracted, inFlight, completed, cached, failed and pending counts, then execute nextCall. Running is not completion. On failure report the exact errorStage and error, not an invented inference failure."
+        elif result.get("state") in {"failed", "interrupted"}:
+            result["nextStep"] = "Report the exact errorStage/currentResource/error. No grouping was applied by indexing. Report browser extraction errors accurately or retry blindly."
+        elif result.get("state") == "complete" and result.get("failed", 0):
+            result["nextStep"] = "Indexing completed with partial coverage. Continue using successfully indexed resources, report failedResources, and retry only those pages if the user asks."
         return result
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False))
     @errors
     async def search_resources(resource: Kind, query: Annotated[str, Field(min_length=1, max_length=500)],
-                               offset: Offset = 0, limit: Limit = 20, mode: Literal["keyword", "semantic", "hybrid"] = "hybrid") -> dict[str, Any]:
-        """Local hybrid keyword/semantic search across explicitly chosen tabs or bookmarks; only matching compact results reach the agent."""
-        return await library.search(resource, query, offset, limit, mode)
+                               offset: Offset = 0, limit: Limit = 20) -> dict[str, Any]:
+        """Local FTS5 keyword search across explicitly chosen tabs or bookmarks; only matching compact results reach the agent."""
+        return await library.search(resource, query, offset, limit)
+
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False))
+    @errors
+    async def selection_action(action: Literal["create", "combine", "show"], resource: Kind, ids: list[ResourceID] | None = None,
+                               query: str = "",
+                               selection_ids: list[str] | None = None,
+                               operation: Literal["union", "intersect", "exclude"] = "union",
+                               selection_id: str = "", offset: Offset = 0, limit: Limit = 20, group_id: int | None = None) -> dict[str, Any]:
+        """Create a local bulk selection from exact IDs or a keyword query, combine selections, or show compact examples. A query selection contains all matching resources, not just the current page. Selections are revalidated before mutation."""
+        ids = list(dict.fromkeys(map(str, ids))) if ids is not None else None
+        if group_id is not None:
+            if resource != "tabs" or action != "create" or query:
+                raise ValueError("group_id scopes exact tab selection creation; combine with a search selection separately")
+            ids = [row["id"] for row in await library.records(resource, ids) if row.get("groupId") == group_id]
+        return await library.selection(action, resource, ids, query, selection_ids, operation, selection_id, offset, limit)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True))
     @errors
-    async def group_resources(resource: Kind, mode: Literal["fast", "precise"] = "fast", ids: list[str] | None = None,
-                              instruction: Annotated[str, Field(max_length=1000)] = "", categories: list[str] | None = None,
-                              max_groups: Annotated[int, Field(ge=1, le=100)] | None = None,
-                              parent_id: str | None = None, confirm_index: bool = False) -> dict[str, Any]:
-        """Fast: local embeddings/clusters/keyword names then native grouping. Precise: return a plan for the CONNECTED AGENT to refine using selected evidence. Neither closes tabs nor deletes bookmarks. Agent translates prompts into explicit categories, counts, or plan refinements."""
-        if categories is not None and (not categories or len(categories) > 100 or any(not value.strip() or len(value) > 80 for value in categories)):
-            raise ValueError("Provide 1 to 100 nonempty category descriptions of at most 80 characters")
-        proposal = await library.propose(resource, ids, categories, max_groups, instruction, confirm_index)
-        if "planId" not in proposal or mode == "precise":
-            return proposal
-        return await library.apply(library.plan(proposal["planId"]), parent_id)
+    async def group_selections(resource: Kind, assignments: list[dict[str, str]], parent_id: str | None = None) -> dict[str, Any]:
+        """Apply exact agent-decided selection assignments directly. Each assignment is {selection_id,title}; tabs stay open. Bookmark use must be explicitly requested. Every target is checked against live metadata before native grouping/folder operations; undo_last restores changes."""
+        return await library.assign_selections(resource, assignments, parent_id)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True))
     @errors
-    async def group_plan(action: Literal["show", "members", "rename", "merge", "assign"], plan_id: str,
-                         group_ids: list[str] | None = None, ids: list[str] | None = None, title: str = "",
-                         parent_id: str | None = None, offset: Offset = 0, limit: Limit = 20) -> dict[str, Any]:
-        """Review or edit a cached proposal: show examples/members, rename/merge groups, assign selected resource IDs. This tool NEVER applies browser changes. Use apply_grouping for final names and application."""
-        plan = library.plan(plan_id)
-        if action == "members":
-            if not group_ids or len(group_ids) != 1:
-                raise ValueError("Select one group ID, or use unclassified")
-            assigned = {key for group in plan["groups"] for key in group["ids"]}
-            if group_ids[0] == "unclassified":
-                members = [row for row in plan["selection"] if row["id"] not in assigned]
-            else:
-                group = next((group for group in plan["groups"] if group["id"] == group_ids[0]), None)
-                if group is None:
-                    raise ValueError("Group not found")
-                members = [row for row in plan["selection"] if row["id"] in group["ids"]]
-            return {"total": len(members), "offset": offset, "items": [library.compact(row) for row in members[offset:offset+limit]]}
-        if action == "show":
-            return library.show_plan(plan, offset, limit)
-        if plan["state"] != "ready":
-            raise ValueError("Generate a new plan after an already applied or uncertain operation")
-        selected = [group for group in plan["groups"] if group["id"] in (group_ids or [])]
-        if len(selected) != len(set(group_ids or [])):
-            raise ValueError("Unknown group IDs")
-        if title and len(title) > 80:
-            raise ValueError("Group title exceeds 80 characters")
-        if action == "rename":
-            if len(selected) != 1 or not title.strip():
-                raise ValueError("Rename needs one group and a title")
-            selected[0]["title"] = title
-        elif action == "merge":
-            if len(selected) < 2:
-                raise ValueError("Merge needs at least two group IDs")
-            selected[0]["ids"] = [key for group in selected for key in group["ids"]]
-            selected[0]["title"] = title or selected[0]["title"]
-            plan["groups"] = [group for group in plan["groups"] if group not in selected[1:]]
-        else:
-            allowed = {row["id"] for row in plan["selection"]}
-            if not ids or not set(ids) <= allowed or len(selected) > 1 or not selected and not title.strip():
-                raise ValueError("Assign selected resource IDs to one group, or supply a new group title")
-            for group in plan["groups"]:
-                group["ids"] = [key for key in group["ids"] if key not in ids]
-            if selected:
-                selected[0]["ids"].extend(dict.fromkeys(ids))
-            else:
-                plan["groups"].append({"id": secrets.token_hex(4), "title": title, "ids": list(dict.fromkeys(ids))})
-            plan["groups"] = [group for group in plan["groups"] if group["ids"]]
-        plan["unclassified"] = len(plan["selection"]) - len({key for group in plan["groups"] for key in group["ids"]})
-        library.save_plan(plan)
-        return library.show_plan(plan)
+    async def move_selection(selection_id: str, group_id: int) -> dict[str, Any]:
+        """Move one exact tab selection into an existing native Chrome group in the same window. Use selection_action first; verified and undoable."""
+        return await library.assign_selections("tabs", [{"selection_id": selection_id, "title": "Existing group"}], target_group_id=group_id)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True))
     @errors
-    async def apply_grouping(plan_id: str, names: dict[str, str] | None = None, parent_id: str | None = None) -> dict[str, Any]:
-        """Apply a reviewed proposal to Chrome. Optional names maps planGroupId values (not tab/bookmark IDs or native Chrome groupId) to meaningful titles. Renames and applies in one call; no reindexing or generative inference. Keeps user tabs open and bookmarks intact."""
-        plan = library.plan(plan_id)
-        allowed = {group["id"] for group in plan["groups"]}
-        if names:
-            if not set(names) <= allowed or any(not title.strip() or len(title) > 80 for title in names.values()):
-                raise ValueError("No browser changes made: names must map proposal group IDs to nonempty titles of at most 80 characters")
-            if plan["state"] != "ready":
-                raise ValueError("No browser changes made: plan is no longer ready")
-            for group in plan["groups"]:
-                group["title"] = names.get(group["id"], group["title"])
-            library.save_plan(plan)
-        result = await library.apply(plan, parent_id)
-        return {**result, "planId": plan_id, "applied": True}
+    async def tab_selection(action: Literal["move", "close"], selection_id: str, window_id: int | None = None,
+                            index: int | None = None, confirmed: bool = False) -> dict[str, Any]:
+        """Move/reorder or close an exact local selection using native bulk Chrome APIs. Closing requires user confirmation. Verified and undoable."""
+        rows = await library.current_selection("tabs", selection_id)
+        if action == "close" and not confirmed:
+            return {"requiresConfirmation": True, "count": len(rows), "executed": False, "noChangesMade": True,
+                    "question": f"Close these {len(rows)} tabs?", "nextAction": "ask_user", "waitingFor": "user"}
+        if action == "move" and window_id is None:
+            raise ValueError("move requires window_id")
+        arguments = {"tabIds": [int(row["id"]) for row in rows], "mode": "batch"}
+        if action == "move":
+            arguments.update(windowId=window_id, index=index)
+        return await library.mutate("move_tabs" if action == "move" else "close_tabs", arguments)
+
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True))
     @errors
     async def bookmark_action(action: Literal["create", "rename", "move", "delete", "save_tabs", "open"],
-                              ids: list[str] | None = None, parent_id: str | None = None, title: str | None = None,
+                              ids: list[ResourceID] | None = None, parent_id: str | None = None, title: str | None = None,
                               url: str | None = None, index: int | None = None, window_id: int | None = None,
-                              warned: bool = False) -> dict[str, Any]:
-        """Explicit bookmark operations: create URL/folder, rename, reorder/move, delete, save selected tabs, or open bookmarks (optionally as a named tab group). Before deletion show the warning; existing user authorization is sufficient."""
+                              warned: bool = False, selection_id: str | None = None,
+                              confirmed: Annotated[bool, Field(description="True only after the user confirms this exact deletion; a warning alone is insufficient")] = False) -> dict[str, Any]:
+        """Explicit bookmark operations. Use selection_id for bulk selections. Deletion requires the agent to ask the user for confirmation of the exact scope before confirmed=true; warned is retained only for older clients."""
+        if selection_id and ids:
+            raise ValueError("Provide ids or a bookmark selection_id, not both")
+        ids = list(dict.fromkeys(map(str, ids))) if ids is not None else None
+        if selection_id:
+            if action == "create":
+                raise ValueError("Creating a bookmark does not consume a selection")
+            kind = "tabs" if action == "save_tabs" else "bookmarks"
+            ids = [row["id"] for row in await library.current_selection(kind, selection_id)]
         if ids is not None and len(ids) > 5000:
             raise ValueError("Operate on at most 5000 resources")
-        if action == "delete" and not warned:
-            return {"warning": "This deletes selected bookmarks/folders, including folder descendants. Undo can recreate them with new IDs.",
-                    "executed": False, "nextStep": "Warn the user, then use warned=true if their request already authorizes this exact deletion."}
+        if action == "delete" and not confirmed:
+            return {"requiresConfirmation": True, "question": f"Delete the selected {len(ids or [])} bookmarks/folders, including folder descendants?",
+                    "warning": "Undo may recreate bookmarks with new IDs.", "executed": False, "noChangesMade": True,
+                    "nextAction": "ask_user", "waitingFor": "user",
+                    "nextStep": "Use the agent's native question/confirmation tool (or ask in chat) and wait for the user's answer. Set confirmed=true only after confirmation of this exact selection."}
         if action == "open" and ids:
             ids = [row["id"] for row in library.web(await library.records("bookmarks", ids, expand=True))]
         return await library.mutate("bookmark_action", {key: value for key, value in {
@@ -538,7 +594,7 @@ def register_library_tools(mcp, library):
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False))
     @errors
     async def find_duplicates(resource: Kind, offset: Offset = 0, limit: Limit = 20) -> dict[str, Any]:
-        """Find exact-URL duplicates in explicitly selected tabs or bookmarks. Preview only; deletion/closing uses separate warned operations."""
+        """Find exact-URL duplicates in explicitly selected tabs or bookmarks. Preview only; deletion/closing requires separate user-confirmed operations."""
         grouped = defaultdict(list)
         for row in library.web(await library.records(resource)):
             grouped[row["url"]].append(row)
@@ -549,9 +605,14 @@ def register_library_tools(mcp, library):
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False))
     @errors
-    async def export_urls(resource: Kind, format: Literal["txt", "csv"] = "txt", ids: list[str] | None = None,
-                          query: str = "", tab_id_for_links: int | None = None) -> dict[str, Any]:
+    async def export_urls(resource: Kind, format: Literal["txt", "csv"] = "txt", ids: list[ResourceID] | None = None,
+                          query: str = "", tab_id_for_links: int | None = None, selection_id: str | None = None) -> dict[str, Any]:
         """Export complete selected URL collections to a local TXT/CSV file without flooding agent context. Optional tab_id_for_links exports links inside a selected webpage."""
+        ids = list(dict.fromkeys(map(str, ids))) if ids is not None else None
+        if selection_id:
+            if ids is not None or tab_id_for_links is not None:
+                raise ValueError("Use a selection, exact IDs, or a page-link target, not multiple scopes")
+            ids = [row["id"] for row in await library.current_selection(resource, selection_id)]
         if tab_id_for_links is not None:
             result = await library.bridge.call("inspect_page", {"tabId": tab_id_for_links, "detail": "links", "limit": 5000})
             rows = result["links"]
@@ -580,6 +641,13 @@ def register_library_tools(mcp, library):
         """Explicit selected-page evidence for the connected agent, including actual masked MCP images. Suspended tabs are inspected on demand. Bookmark inspection uses a disposable tab and closes only that temporary tab."""
         arguments = {"tabId": int(id)} if resource == "tabs" else {"bookmarkId": id}
         cached = library.cached(resource, id) if not refresh else None
+        if cached:
+            try:
+                current = (await library.records(resource, [id]))[0]
+            except ValueError:
+                current = None
+            if current and cached[1] != library.fingerprint(current):
+                cached = None
         result = None
         if cached:
             if detail == "text" and cached[3] >= 1:
@@ -590,47 +658,24 @@ def register_library_tools(mcp, library):
                 if row:
                     result = {"id": id, "image": base64.b64encode(row[0]).decode(), "cached": True}
         if result is None:
-            result = await library.bridge.call("inspect_page", {**arguments, "detail": detail, "offset": offset, "limit": limit})
+            async with library.lock:
+                result = await library.bridge.call("inspect_page", {**arguments, "detail": detail, "offset": offset, "limit": limit})
+                if detail in {"text", "image"}:
+                    current = (await library.records(resource, [id]))[0]
+                    page = {"url": current["url"], "title": result.get("title", current.get("title", "")),
+                            "headings": result.get("headings", []), "text": result.get("text", "")}
+                    if result.get("image"):
+                        page["image_id"] = library.store.index.image(result["image"])
+                    document = library.store.index.document(page)[0]
+                    with library.store.lock, library.store.db:
+                        library.store.db.execute("INSERT OR REPLACE INTO resources VALUES (?,?,?,?,?,?,?,?)",
+                            (resource, id, json.dumps(current), library.fingerprint(current), document, 2 if result.get("image") else 1, None, None))
+                        library.store.db.execute("DELETE FROM resources_fts WHERE kind=? AND id=?", (resource, id))
+                        library.store.db.execute("INSERT INTO resources_fts VALUES (?,?,?,?,?)",
+                            (resource, id, page["title"], page["url"], " ".join(page["headings"]) + "\n" + page["text"]))
         image = result.pop("image", None)
         content = [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
         if image:
             mime = "image/png" if base64.b64decode(image).startswith(b"\x89PNG") else "image/jpeg"
             content.append(ImageContent(type="image", data=image, mime_type=mime))
         return CallToolResult(content=content)
-
-    # Compatibility aliases keep existing clients working without the removed generative backend.
-    @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False))
-    @errors
-    async def index_tabs(tab_ids: list[int] | None = None, visual: bool = False, confirm_index: bool = False) -> dict[str, Any]:
-        """Index tabs only. Prefer index_resources for explicit metadata/text/image levels and job progress."""
-        result = await library.index("tabs", [str(key) for key in tab_ids] if tab_ids else None,
-                                     "image" if visual else "text", confirm_index)
-        return {**result, "visual": result.get("total", 0) if visual else 0}
-
-    @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False))
-    @errors
-    async def search_tabs(query: str, offset: Offset = 0, limit: Limit = 20,
-                          mode: Literal["keyword", "semantic", "hybrid"] = "keyword") -> dict[str, Any]:
-        """Search indexed tabs only; bookmark search must be requested explicitly through search_resources."""
-        result = await library.search("tabs", query, offset, limit, mode)
-        items = result.pop("items")
-        for item in items:
-            item["id"] = int(item["id"])
-        return {**result, "tabs": items, "mode": mode}
-
-    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True))
-    @errors
-    async def organize_by_text(instruction: str, tab_ids: list[int] | None = None, categories: list[str] | None = None,
-                               processing: Literal["fast", "precise", "simple", "rigorous"] = "fast",
-                               confirm_index: bool = False) -> dict[str, Any]:
-        """Compatibility entry: local Fast grouping or a Precise plan for the connected agent. No backend LLM or automatic screenshot sweep."""
-        mode = "precise" if processing in {"precise", "rigorous"} else "fast"
-        return await group_resources("tabs", mode, [str(key) for key in tab_ids] if tab_ids else None, instruction,
-                                     categories, confirm_index=confirm_index)
-
-    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False))
-    @errors
-    async def catalogue_tabs(action: Literal["start", "status", "resume", "cancel"] = "start", job_id: str = "",
-                             tab_ids: list[int] | None = None, confirm_index: bool = False) -> dict[str, Any]:
-        """Compatibility indexing job for tabs only. Use index_resources for bookmarks or deeper extraction."""
-        return await library.job(action, "tabs", [str(key) for key in tab_ids] if tab_ids else None, "metadata", confirm_index, job_id)

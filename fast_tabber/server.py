@@ -4,12 +4,10 @@ import asyncio
 import hmac
 import hashlib
 import json
-import math
 import os
 import re
 import secrets
 import sqlite3
-import struct
 import threading
 import time
 from collections import deque
@@ -26,21 +24,12 @@ from pydantic import Field
 from starlette.responses import JSONResponse, Response
 from starlette.routing import WebSocketRoute, Route
 from starlette.websockets import WebSocket, WebSocketDisconnect
-from fast_tabber.semantic import cosine
 from fast_tabber.index import ContentIndex
 from fast_tabber.library import Library, register_library_tools
 from fast_tabber.onboarding import Onboarding
-from fast_tabber.preflight import OLLAMA
 from fast_tabber.pairing import Pairing
 
 STATE = Path(__file__).resolve().parent.parent / ".state"
-
-
-def processing_choice():
-    return {"requiresChoice": True, "question": "Simple text-only grouping or rigorous screenshot-assisted batching?",
-            "choices": {"simple": "Rendered text and cached content; no screenshots",
-                        "rigorous": "Text first, screenshots for unresolved tabs; may activate Chrome"},
-            "started": False}
 
 
 class StateStore:
@@ -69,10 +58,11 @@ class StateStore:
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS resources (kind TEXT,id TEXT,metadata TEXT,fingerprint TEXT,document TEXT,level INTEGER,vector BLOB,model TEXT,PRIMARY KEY(kind,id))")
             self.db.execute("CREATE TABLE IF NOT EXISTS grouping_plans (id TEXT PRIMARY KEY,payload TEXT)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS selections (id TEXT PRIMARY KEY,kind TEXT NOT NULL,items TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
             self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(kind UNINDEXED,id UNINDEXED,title,url,content)")
 
     def local_data(self, scope, delete=False):
-        tables = ["pages_fts", "pages", "document_artifacts", "documents", "artifacts", "catalogue_jobs", "resources_fts", "resources", "grouping_plans"]
+        tables = ["pages_fts", "pages", "document_artifacts", "documents", "artifacts", "catalogue_jobs", "resources_fts", "resources", "grouping_plans", "selections"]
         if scope == "all":
             tables += ["collections", "undo"]
         backups = list(self.path.parent.glob("browser-before-*.sqlite3"))
@@ -81,7 +71,7 @@ class StateStore:
             report = {"scope": scope, "records": counts, "indexBackups": [path.name for path in backups[:20]], "backupCount": len(backups),
                       "preservesRecoveryHistory": scope == "cache", "deleted": False}
             if not delete:
-                return {**report, "requiresConfirmation": True}
+                return {**report, "requiresConfirmation": True, "nextAction": "ask_user", "waitingFor": "user"}
             self.db.execute("PRAGMA secure_delete=ON")
             exports = self.path.parent / "exports"
             if exports.exists():
@@ -194,77 +184,21 @@ class StateStore:
         with self.lock, self.db:
             self.db.execute("DELETE FROM undo WHERE id=?", (entry_id,))
 
-    def save_pages(self, pages: list[dict], model_digest: str | None = None):
-        changed = []
+    def save_pages(self, pages: list[dict]):
         with self.lock, self.db:
             for page in pages:
                 tab_id = page["id"]
-                self.db.execute("DELETE FROM pages_fts WHERE rowid=?", (tab_id,))
                 parsed = urlsplit(page["url"])
-                content = page["text"]
-                headings = " ".join(page["headings"])
                 host = f"[{parsed.hostname}]" if ":" in (parsed.hostname or "") else parsed.hostname
                 origin = f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port else "")
+                headings, content = " ".join(page["headings"]), page["text"]
                 digest = hashlib.sha256(json.dumps([page["title"], headings, content], ensure_ascii=False).encode()).hexdigest()
-                current = self.db.execute("SELECT url_hash, embedding, embedding_digest FROM pages WHERE tab_id=?", (tab_id,)).fetchone()
-                changed_text = current is None or current[0] != digest
-                stale_embedding = model_digest is not None and (current is None or current[1] is None or current[2] != model_digest)
-                embedding, embedding_digest = (None, None) if changed_text or stale_embedding else (current[1], current[2])
-                self.db.execute("INSERT INTO pages (tab_id, window_id, url_hash, title, origin, headings, content, embedding, embedding_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(tab_id) DO UPDATE SET window_id=excluded.window_id, url_hash=excluded.url_hash, title=excluded.title, origin=excluded.origin, headings=excluded.headings, content=excluded.content, embedding=excluded.embedding, embedding_digest=excluded.embedding_digest",
-                    (tab_id, page["windowId"], digest, page["title"][:200], origin, headings, content, embedding, embedding_digest))
-                if model_digest is not None and (changed_text or stale_embedding):
-                    changed.append({"id": tab_id, "digest": digest, "text": f"{page['title']}\n{headings}\n{content}"})
-                self.db.execute("INSERT INTO pages_fts(rowid, title, origin, headings, content) VALUES (?, ?, ?, ?, ?)",
+                self.db.execute("INSERT INTO pages (tab_id,window_id,url_hash,title,origin,headings,content) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(tab_id) DO UPDATE SET window_id=excluded.window_id,url_hash=excluded.url_hash,title=excluded.title,origin=excluded.origin,headings=excluded.headings,content=excluded.content",
+                    (tab_id, page["windowId"], digest, page["title"][:200], origin, headings, content))
+                self.db.execute("DELETE FROM pages_fts WHERE rowid=?", (tab_id,))
+                self.db.execute("INSERT INTO pages_fts(rowid,title,origin,headings,content) VALUES (?,?,?,?,?)",
                     (tab_id, page["title"][:200], origin, headings, content))
-        return changed
-
-    def save_embeddings(self, pages: list[dict], vectors: list[list[float]], model_digest: str):
-        if len(pages) != len(vectors) or not pages:
-            raise ValueError("Embedding output count did not match indexed pages")
-        dimensions = {len(vector) for vector in vectors}
-        if len(dimensions) != 1 or not dimensions.pop() or any(not all(map(math.isfinite, vector)) or not any(vector) for vector in vectors):
-            raise ValueError("Embedding output contains invalid vectors")
-        with self.lock, self.db:
-            for page, vector in zip(pages, vectors):
-                row = self.db.execute("SELECT url_hash FROM pages WHERE tab_id=?", (page["id"],)).fetchone()
-                if not row or row[0] != page["digest"]:
-                    raise RuntimeError("Page text changed during embedding; re-index before semantic operations")
-                blob = struct.pack(f"<{len(vector)}f", *vector)
-                self.db.execute("UPDATE pages SET embedding=?, embedding_digest=? WHERE tab_id=?",
-                                (blob, model_digest, page["id"]))
-
-    def get_page_vectors(self, tab_ids: list[int], model_digest: str):
-        if not tab_ids:
-            return {}
-        marks = ",".join("?" for _ in tab_ids)
-        with self.lock:
-            rows = self.db.execute(f"SELECT tab_id, embedding FROM pages WHERE embedding_digest=? AND tab_id IN ({marks})",
-                                   (model_digest, *tab_ids)).fetchall()
-        return {row[0]: struct.unpack(f"<{len(row[1]) // 4}f", row[1]) for row in rows}
-
-    def pending_embeddings(self, model_digest: str):
-        with self.lock:
-            rows = self.db.execute("SELECT tab_id, url_hash, title, headings, content FROM pages WHERE embedding IS NULL OR embedding_digest!=?", (model_digest,)).fetchall()
-        return [{"id": row[0], "digest": row[1], "text": f"{row[2]}\n{row[3]}\n{row[4]}"} for row in rows]
-
-    def semantic_search(self, query_vector: list[float], offset: int, limit: int, model_digest: str):
-        if not query_vector or not all(map(math.isfinite, query_vector)) or not any(query_vector):
-            raise ValueError("Semantic query returned an invalid embedding")
-        with self.lock:
-            rows = self.db.execute("SELECT tab_id, window_id, title, origin, content, embedding FROM pages WHERE embedding_digest=? AND embedding IS NOT NULL",
-                                   (model_digest,)).fetchall()
-        q_norm = math.sqrt(sum(value * value for value in query_vector))
-        scored = []
-        for tab_id, window_id, title, origin, content, blob in rows:
-            vector = struct.unpack(f"<{len(blob) // 4}f", blob)
-            if len(vector) != len(query_vector):
-                raise RuntimeError("Stored embedding dimensions differ from the current model; re-index tabs")
-            score = sum(a * b for a, b in zip(query_vector, vector)) / (q_norm * math.sqrt(sum(value * value for value in vector)))
-            scored.append((score, tab_id, window_id, title, origin, content))
-        scored.sort(key=lambda row: (-row[0], row[1]))
-        return [{"id": row[1], "windowId": row[2], "title": row[3], "origin": row[4],
-                 "snippet": row[5][:240], "score": round(row[0], 4)} for row in scored[offset:offset + limit]], len(scored)
 
     def remove_pages(self, tab_ids: list[int]):
         with self.lock, self.db:
@@ -277,7 +211,7 @@ class StateStore:
             raise ValueError("query must contain searchable words")
         match = " AND ".join('"' + term.replace('"', '""') + '"' for term in terms[:20])
         with self.lock:
-            rows = self.db.execute("SELECT p.tab_id, p.window_id, p.title, p.origin, snippet(pages_fts, 3, '', '', ' … ', 24) FROM pages_fts JOIN pages p ON p.tab_id=pages_fts.rowid WHERE pages_fts MATCH ? ORDER BY bm25(pages_fts) LIMIT ? OFFSET ?",
+            rows = self.db.execute("SELECT p.tab_id, p.window_id, p.title, p.origin, snippet(pages_fts, 3, '', '', ' â€¦ ', 24) FROM pages_fts JOIN pages p ON p.tab_id=pages_fts.rowid WHERE pages_fts MATCH ? ORDER BY bm25(pages_fts) LIMIT ? OFFSET ?",
                                    (match, limit, offset)).fetchall()
         return [{"id": row[0], "windowId": row[1], "title": row[2], "origin": row[3], "snippet": row[4][:240]} for row in rows]
 
@@ -296,6 +230,7 @@ class Bridge:
         self.extension_version = None
         self.pending: dict[str, asyncio.Future] = {}
         self.lock = asyncio.Lock()
+        self.send_lock = asyncio.Lock()
 
     async def call(self, operation: str, arguments: dict | None = None, timeout: float = 15):
         if operation not in {"probe", "list_tabs", "tab_action", "group_action", "move_tabs", "close_tabs",
@@ -304,15 +239,15 @@ class Bridge:
             raise ValueError("Browser operation is not enabled")
         if operation == "extract_tabs":
             timeout = max(timeout, 180)
-        if operation in {"bookmark_action", "restore_bookmarks"}:
+        if operation in {"bookmark_action", "restore_bookmarks", "group_categories", "group_action", "move_tabs"}:
             timeout = max(timeout, 300)
         if operation == "inspect_page":
-            timeout = max(timeout, 120)
+            timeout = max(timeout, 120 if (arguments or {}).get("detail") == "image" else 35)
         if operation == "capture_page":
             timeout = max(timeout, 60)
         if operation in {"capture_browser", "restore_snapshot"}:
             timeout = max(timeout, 180)
-        async with self.lock:
+        async def perform():
             if self.peer is None:
                 raise RuntimeError("Chrome extension is disconnected. Open the paired Chrome profile if it is closed; "
                                    "allow up to 30 seconds for reconnection after a service restart. If already enabled, reload Fast-Tabber in chrome://extensions. "
@@ -321,12 +256,19 @@ class Bridge:
             future = asyncio.get_running_loop().create_future()
             self.pending[request_id] = future
             try:
-                await self.peer.send_json({"id": request_id, "operation": operation, "arguments": arguments or {}})
+                async with self.send_lock:
+                    if self.peer is None:
+                        raise RuntimeError("Chrome disconnected before request dispatch")
+                    await self.peer.send_json({"id": request_id, "operation": operation, "arguments": arguments or {}})
                 return await asyncio.wait_for(future, timeout)
             except (TimeoutError, WebSocketDisconnect, OSError) as error:
                 raise RuntimeError("Chrome request failed; outcome unknown. Reconcile browser state before retrying.") from error
             finally:
                 self.pending.pop(request_id, None)
+        if operation == "inspect_page" and (arguments or {}).get("detail") == "text":
+            return await perform()
+        async with self.lock:
+            return await perform()
 
     async def connect(self, socket: WebSocket, token: str, origin: str, pairing=None, legacy_token=None):
         if socket.headers.get("origin") != origin or self.peer is not None:
@@ -415,13 +357,10 @@ def create_app(token: str, origin: str, database: Path | None = None):
     pairing = Pairing(token)
     store = StateStore(database or (STATE / "browser.sqlite3"))
     operation_lock = asyncio.Lock()
-    index_lock = asyncio.Lock()
-    inference_lock = asyncio.Lock()
     processing_lock = asyncio.Lock()
-    catalogue_control_lock = asyncio.Lock()
     catalogue_tasks = {}
     setup = Onboarding(store.path.parent, bridge, lambda: processing_lock.locked() or operation_lock.locked()
-                       or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values()), processing_lock)
+                       or any(not task.done() for task in catalogue_tasks.values()), processing_lock)
     def serialized(lock):
         def decorate(function):
             @wraps(function)
@@ -431,13 +370,13 @@ def create_app(token: str, origin: str, database: Path | None = None):
             return run
         return decorate
     serialized_processing = serialized(processing_lock)
-    serialized_catalogue = serialized(catalogue_control_lock)
-    mcp = MCPServer("fast-tabber", version="0.7.1", instructions="Manage Chrome tabs and explicitly requested bookmarks. Local EmbeddingGemma supplies indexing; the connected agent supplies reasoning. Keep results bounded and user tabs open during grouping.")
+    mcp = MCPServer("fast-tabber", version="1.0.0", instructions="Ask the user through the agent's native question tool for ANY unclear decision; reuse clear instructions and previous answers. Explain indexing, obtain missing consent and confirm closing/deletion. Follow nextAction/nextCall: pending work is not failure, ask_user waits for a reply, stop resolves an error. Announce waits and report actual progress. Never replay an uncertain mutation.")
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, open_world_hint=True))
-    async def onboarding(action: Literal["status", "download", "verify", "browser", "acknowledge_privacy"] = "status",
-                         model: str = "", confirm: bool = False) -> dict[str, Any]:
-        """First-run privacy disclosure, approved EmbeddingGemma download, text/image embedding verification and live Chrome pairing. Does not select or run a generative chat model. Recheck Chrome after the user's setup reply."""
+    async def onboarding(action: Literal["status", "browser", "acknowledge_privacy"] = "status",
+                         confirm: bool = False,
+                         wait_seconds: Annotated[int, Field(ge=0, le=30)] = 0) -> dict[str, Any]:
+        """First-run privacy disclosure and live Chrome pairing. No inference runtime or models are required. Recheck Chrome after the user's setup reply."""
         if action == "browser":
             try:
                 status = await bridge.call("probe")
@@ -450,11 +389,13 @@ def create_app(token: str, origin: str, database: Path | None = None):
                                   "Load extensionFolder unpacked at chrome://extensions",
                                   "Approve any requested permissions", "Call browser_setup(action='pair'), open setupUrl in Chrome and click Connect Fast-Tabber",
                                   "Reply in this agent chat when ready; the agent must call onboarding(action='browser') again"],
-                        "awaitingUserReply": True}
-        return await setup.call(action, model, confirm)
+                        "awaitingUserReply": True, "nextAction": "ask_user", "waitingFor": "user",
+                        "afterUserReply": {"tool": "onboarding", "arguments": {"action": "browser"}},
+                        "nextStep": "Explain the connection/setup issue, ask the user to complete the steps, then wait for their reply before afterUserReply. The MCP service is responding; Chrome is not connected."}
+        return await setup.call(action, confirm=confirm, wait_seconds=wait_seconds)
 
     async def mutate(operation: str, arguments: dict, collection_name: str | None = None):
-        async with operation_lock:
+        async with processing_lock, operation_lock:
             latest = store.latest_undo()
             if latest and latest[2] in {"executing", "failed", "applying"}:
                 raise RuntimeError("A previous mutation needs recovery; use undo_last before further changes")
@@ -490,9 +431,6 @@ def create_app(token: str, origin: str, database: Path | None = None):
             return result
 
 
-
-
-
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
     async def browser_status() -> dict[str, Any]:
         """Verify the real Chrome connection and permissions without returning page content."""
@@ -503,12 +441,14 @@ def create_app(token: str, origin: str, database: Path | None = None):
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, open_world_hint=False))
     async def browser_setup(action: Literal["reload_extension", "pair"] = "reload_extension") -> dict[str, Any]:
-        """Create a five-minute one-click Chrome setup link (no code copying), or reload an already paired unpacked extension. Manual code is recovery only."""
+        """Create a five-minute Chrome setup link, or reload a paired extension. Announce reload/reconnection before calling; it may wait up to 30 seconds. Manual code is recovery only."""
         if action == "pair":
-            return {**pairing.issue(), "extensionOrigin": origin}
+            return {**pairing.issue(), "extensionOrigin": origin, "nextAction": "ask_user", "waitingFor": "user",
+                    "afterUserReply": {"tool": "onboarding", "arguments": {"action": "browser"}},
+                    "nextStep": "Give the user the setup link, wait for their reply, then execute afterUserReply to verify the connection."}
         if action != "reload_extension":
             raise ToolError("action must be reload_extension")
-        async with operation_lock:
+        async with processing_lock, operation_lock:
             await bridge.call("reload_extension")
             for _ in range(30):
                 await asyncio.sleep(1)
@@ -528,14 +468,16 @@ def create_app(token: str, origin: str, database: Path | None = None):
         if offset < 0 or not 1 <= limit <= 100:
             raise ToolError("offset must be nonnegative and limit must be between 1 and 100")
         try:
-            return await bridge.call("list_tabs", {"windowId": window_id, "offset": offset, "limit": limit})
+            result = await bridge.call("list_tabs", {"windowId": window_id, "offset": offset, "limit": limit})
+            end = offset + len(result["tabs"])
+            return {**result, "returned": len(result["tabs"]), "hasMore": end < result["total"], "nextOffset": end if end < result["total"] else None}
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
     async def tab_action(action: Literal["open", "close", "activate", "move"], tab_id: int | None = None, url: str | None = None,
-                         window_id: int | None = None, index: int | None = None) -> dict[str, Any]:
-        """Open, close, activate, or move one tab. Actions: open(url), close/activate(tab_id), move(tab_id, window_id, index)."""
+                         window_id: int | None = None, index: int | None = None, confirmed: bool = False) -> dict[str, Any]:
+        """Open, close, activate, or move a tab. Before close, ask the user through the agent's native confirmation tool and set confirmed=true only after their answer."""
         try:
             if action not in {"open", "close", "activate", "move"}:
                 raise ValueError("action must be open, close, activate, or move")
@@ -547,24 +489,42 @@ def create_app(token: str, origin: str, database: Path | None = None):
                 raise ValueError(f"{action} requires tab_id")
             if action == "move" and window_id is None:
                 raise ValueError("move requires window_id")
+            if action == "close" and not confirmed:
+                return {"requiresConfirmation": True, "question": "Close the selected tab? Unsaved page state may be lost.",
+                        "executed": False, "noChangesMade": True, "tabId": tab_id,
+                        "nextAction": "ask_user", "waitingFor": "user",
+                        "nextStep": "Ask through the agent's native confirmation/question tool (or chat) and wait. Set confirmed=true only after the user's confirmation."}
             return await mutate("tab_action", {"action": action, "tabId": tab_id, "url": url,
                                                 "windowId": window_id, "index": index})
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
-    async def organize_tabs(action: Literal["create", "add", "remove", "update", "delete", "move"], tab_ids: list[int] | None = None, group_id: int | None = None,
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, open_world_hint=False))
+    async def organize_tabs(action: Literal["create", "add", "remove", "ungroup_all", "update", "delete", "move"], tab_ids: list[int] | None = None, group_id: int | None = None,
                             title: str | None = None, color: str | None = None, collapsed: bool | None = None,
                             window_id: int | None = None, index: int | None = None, mode: str = "batch") -> dict[str, Any]:
-        """Edit native groups with explicit tab/group IDs. Not natural-language organization: use catalogue_tabs for that."""
+        """Native group edits. ungroup_all resolves all grouped tabs locally (optional window_id); no IDs needed. remove+tab_ids ungroups selected tabs; remove+group_id or delete+group_id ungroups one whole group. These reversible edits never close tabs, delete bookmarks, or require a second confirmation when explicitly requested. Indexing does not change groups. Use local selections for exact agent-decided assignments."""
         try:
             if mode not in {"batch", "sequential"}:
                 raise ValueError("mode must be batch or sequential")
             ids = tab_ids or []
-            if len(ids) > 500 or len(set(ids)) != len(ids):
-                raise ValueError("tab_ids must be unique and contain at most 500 IDs")
+            ungroup_all = action == "ungroup_all"
+            if ungroup_all:
+                if tab_ids is not None or group_id is not None:
+                    raise ValueError("ungroup_all accepts an optional window_id, not tab_ids or group_id")
+                snapshot = await bridge.call("capture_browser")
+                ids = [tab["id"] for tab in snapshot["tabs"] if tab.get("groupId", -1) >= 0 and not tab.get("incognito")
+                       and (window_id is None or tab["windowId"] == window_id)]
+                if not ids:
+                    return {"ungrouped": 0, "verified": True, "noChangesMade": True}
+                action = "remove"
+            if action == "remove" and not ids and group_id is not None:
+                action = "delete"
+            limit = 5000 if ungroup_all else 500
+            if len(ids) > limit or len(set(ids)) != len(ids):
+                raise ValueError(f"tab_ids must be unique and contain at most {limit} IDs")
             if action in {"create", "add", "remove", "move"} and not ids:
-                raise ValueError(f"{action} requires tab_ids; natural-language organization uses catalogue_tabs after asking Simple or Rigorous")
+                raise ValueError(f"No browser changes made: {action} requires tab_ids. To ungroup everything use action='ungroup_all'; for one group use action='remove' with group_id. Tabs stay open.")
             if action in {"add", "update", "delete"} and group_id is None:
                 raise ValueError(f"{action} requires group_id")
             if action == "update" and title is None and color is None and collapsed is None:
@@ -577,14 +537,14 @@ def create_app(token: str, origin: str, database: Path | None = None):
                 arguments = {"action": action, "tabIds": ids, "groupId": group_id,
                     "title": title, "color": color, "collapsed": collapsed, "mode": mode}
                 result = await mutate("group_action", {key: value for key, value in arguments.items() if value is not None})
-            return {key: value for key, value in result.items() if key != "before"}
+            return {key: value for key, value in result.items() if key != "before"} | ({"ungrouped": len(ids), "verified": True} if ungroup_all else {})
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
     async def collection_action(action: Literal["save", "list", "close", "restore", "delete"], name: str = "", tab_ids: list[int] | None = None,
-                                mode: str = "batch") -> dict[str, Any]:
-        """Save, list, close, restore, or delete a named tab collection."""
+                                mode: str = "batch", confirmed: bool = False) -> dict[str, Any]:
+        """Save/list/restore collections. Closing collection tabs or deleting saved collection data requires the user's confirmation of the named scope before confirmed=true."""
         try:
             if action == "list":
                 return {"collections": store.list_collections()}
@@ -602,6 +562,12 @@ def create_app(token: str, origin: str, database: Path | None = None):
             collection = store.get_collection(name)
             if collection is None:
                 raise ValueError(f"Collection not found: {name}")
+            if action in {"close", "delete"} and not confirmed:
+                question = (f"Close the {len(collection['tabs'])} tabs in saved collection '{name}'?" if action == "close"
+                            else f"Delete saved collection '{name}' from local storage?")
+                return {"requiresConfirmation": True, "question": question, "executed": False, "noChangesMade": True,
+                        "nextAction": "ask_user", "waitingFor": "user",
+                        "nextStep": "Ask the user with the agent's native confirmation/question tool (or chat), then wait for confirmation of this exact scope before confirmed=true."}
             if action == "close":
                 result = await mutate("close_saved_collection", {"tabIds": [tab["id"] for tab in collection["tabs"]], "mode": mode}, name)
                 return {"closed": result["closed"], "missing": result["missing"], "name": name, "verified": result["verified"]}
@@ -621,19 +587,20 @@ def create_app(token: str, origin: str, database: Path | None = None):
             raise ToolError(str(error)) from error
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
-    async def remove_duplicates(window_id: int | None = None, remove: bool = False, mode: str = "batch") -> dict[str, Any]:
+    async def remove_duplicates(window_id: int | None = None, remove: bool = False, mode: str = "batch", confirmed: bool = False) -> dict[str, Any]:
         """Find exact-URL duplicate tabs, or close duplicates after explicit confirmation."""
         try:
             if mode not in {"batch", "sequential"}:
                 raise ValueError("mode must be batch or sequential")
+            if remove and not confirmed:
+                return {"requiresConfirmation": True, "question": "Close duplicate-URL tabs in the selected scope, keeping one copy of each?",
+                        "executed": False, "noChangesMade": True,
+                        "nextAction": "ask_user", "waitingFor": "user",
+                        "nextStep": "Preview duplicates with remove=false, ask the user to confirm the scope through the agent's native question tool, then use remove=true, confirmed=true."}
             result = await mutate("find_duplicates", {"windowId": window_id, "remove": remove, "mode": mode})
             return {key: value for key, value in result.items() if key != "before"}
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
-
-
-
-
 
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True, open_world_hint=False))
@@ -652,7 +619,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
     async def undo_last(all_changes: bool = False) -> dict[str, Any]:
         """Revert the latest toolkit mutation, or all retained toolkit changes in reverse order. Keeps the local index."""
-        async with operation_lock:
+        async with processing_lock, operation_lock:
             completed = []
             restored = 0
             tab_ids = []
@@ -736,7 +703,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         await bridge.connect(socket, pairing.token, origin, pairing, legacy_token=token)
 
     async def health(request):
-        return JSONResponse({"name": "fast-tabber", "version": "0.7.1", "root": str(STATE.parent),
+        return JSONResponse({"name": "fast-tabber", "version": "1.0.0", "root": str(STATE.parent),
             "connected": bridge.peer is not None, "extensionVersion": bridge.extension_version, "pid": os.getpid(),
             "busy": operation_lock.locked() or processing_lock.locked() or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values())})
 

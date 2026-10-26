@@ -27,10 +27,21 @@ function Get-TabberHealth {
     }
 }
 
-Get-Command uv -ErrorAction Stop | Out-Null
-$TabberOllamaCommand = Get-Command ollama -ErrorAction SilentlyContinue
-$TabberOllama = if ($TabberOllamaCommand) { $TabberOllamaCommand.Source } else { Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Ollama\ollama.exe' }
-if (!(Test-Path -LiteralPath $TabberOllama)) { Write-Output 'Ollama is not installed; native browser operations remain available. Install it before semantic onboarding.'; $TabberOllama = $null }
+if (!(Get-Command uv -ErrorAction SilentlyContinue)) {
+    Write-Output 'Installing uv and Python runtime support from astral.sh.'
+    $env:UV_INSTALL_DIR = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Fast-Tabber\bin'
+    Invoke-RestMethod 'https://astral.sh/uv/install.ps1' | Invoke-Expression
+    $env:PATH = "$env:UV_INSTALL_DIR;$env:PATH"
+    Get-Command uv -ErrorAction Stop | Out-Null
+}
+Get-Command node -ErrorAction Stop | Out-Null
+if (!$StartOnly -and $TabberSource -ne $TabberRoot -and (Test-Path -LiteralPath (Join-Path $TabberRoot 'package.json'))) {
+    $TabberSourceVersion = (Get-Content -LiteralPath (Join-Path $TabberSource 'package.json') -Raw | ConvertFrom-Json).version
+    $TabberInstalledVersion = (Get-Content -LiteralPath (Join-Path $TabberRoot 'package.json') -Raw | ConvertFrom-Json).version
+    $TabberVersionModule = ([Uri](Join-Path $TabberSource 'runtime.js')).AbsoluteUri
+    & node --input-type=module -e 'const {compareVersions}=await import(process.argv[1]);process.exit(compareVersions(process.argv[2],process.argv[3])<0?2:0)' $TabberVersionModule $TabberSourceVersion $TabberInstalledVersion
+    if ($LASTEXITCODE -ne 0) { throw 'Refusing to overwrite a newer or unverified Fast-Tabber runtime. Use the current published package.' }
+}
 $TabberHealth = Get-TabberHealth
 if (!$StartOnly) {
     if ($TabberHealth) {
@@ -38,14 +49,11 @@ if (!$StartOnly) {
     }
     New-Item -ItemType Directory -Path $TabberRoot -Force | Out-Null
     if ([IO.Path]::GetFullPath($TabberSource) -ne $TabberRoot) {
-        foreach ($TabberDirectory in @('fast_tabber','extension','.agents\skills\fast-tabber')) {
+        foreach ($TabberDirectory in @('fast_tabber','extension','.agents\skills\fast-tabber','.agents\plugins','plugins\fast-tabber\.codex-plugin','plugins\fast-tabber\skills\fast-tabber')) {
             New-Item -ItemType Directory -Path (Join-Path $TabberRoot $TabberDirectory) -Force | Out-Null
         }
         Get-ChildItem -LiteralPath (Join-Path $TabberSource 'fast_tabber') -Filter '*.py' | Copy-Item -Destination (Join-Path $TabberRoot 'fast_tabber') -Force
-        foreach ($TabberAsset in @('setup.html','setup-page.js','setup-page.css')) {
-            Copy-Item -LiteralPath (Join-Path $TabberSource "fast_tabber\$TabberAsset") -Destination (Join-Path $TabberRoot "fast_tabber\$TabberAsset") -Force
-        }
-        foreach ($TabberFile in @('extension\manifest.json','extension\background.js','extension\bookmarks.js','extension\content.js','extension\export.js','extension\popup.html','extension\popup.css','extension\popup.js','.agents\skills\fast-tabber\SKILL.md','requirements.lock.txt','pyproject.toml','package.json','tabber.ps1','opencode-plugin.js','runtime.js','cli.js','install.ps1','install.cmd','README.md','LICENSE')) {
+        foreach ($TabberFile in @('plugins\fast-tabber\.codex-plugin\plugin.json','plugins\fast-tabber\.mcp.json','plugins\fast-tabber\skills\fast-tabber\SKILL.md','.agents\plugins\marketplace.json','extension\manifest.json','extension\background.js','extension\bookmarks.js','extension\content.js','extension\export.js','extension\popup.html','extension\popup.css','extension\popup.js','.agents\skills\fast-tabber\SKILL.md','fast_tabber\setup.html','fast_tabber\setup-page.js','fast_tabber\setup-page.css','PRIVACY.md','requirements.lock.txt','pyproject.toml','package.json','tabber.ps1','opencode-plugin.js','runtime.js','cli.js','install.ps1','install.cmd','README.md','LICENSE')) {
             Copy-Item -LiteralPath (Join-Path $TabberSource $TabberFile) -Destination (Join-Path $TabberRoot $TabberFile) -Force
         }
     }
@@ -56,19 +64,6 @@ if (!(Test-Path -LiteralPath $TabberPython)) { Invoke-TabberCommand 'uv' @('venv
 if (!$StartOnly) {
     Invoke-TabberCommand 'uv' @('pip','install','--python',$TabberPython,'-r',(Join-Path $TabberRoot 'requirements.lock.txt'))
     Invoke-TabberCommand $TabberPython @('-m','fast_tabber.setup')
-}
-if ($TabberOllama) {
-    $env:OLLAMA_HOST = '127.0.0.1:11434'
-    $env:OLLAMA_NO_CLOUD = '1'
-    try { $TabberModels = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3 } catch {
-        Start-Process -FilePath $TabberOllama -ArgumentList 'serve' -WorkingDirectory $TabberRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $TabberRoot '.state\ollama.stdout.log') -RedirectStandardError (Join-Path $TabberRoot '.state\ollama.stderr.log') | Out-Null
-        for ($TabberWait=0; $TabberWait -lt 30; $TabberWait++) {
-            Start-Sleep -Seconds 1
-            try { $TabberModels = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 2; break } catch {}
-        }
-        if (!$TabberModels) { throw 'Ollama did not start on loopback.' }
-    }
-    if (Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue | Where-Object LocalAddress -NotIn @('127.0.0.1','::1')) { throw 'Ollama must bind only to loopback; configure OLLAMA_HOST=127.0.0.1:11434 and restart it.' }
 }
 if (!$StartOnly) {
     $TabberHealth = Get-TabberHealth
@@ -98,8 +93,8 @@ if (!$StartOnly -and !$NoOpenCode) {
     $TabberModule = ([Uri](Join-Path $TabberRoot 'opencode-plugin.js')).AbsoluteUri | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($TabberEntry, "// Fast-Tabber managed entry`nexport { FastTabberPlugin } from $TabberModule;`n", (New-Object Text.UTF8Encoding($false)))
     Write-Output "Installed MCP server + Skill. Restart OpenCode in: $Workspace"
-    Write-Output 'Use /tabs list my tabs, or select Tabber. Selecting the Skill alone does not install MCP or switch agents.'
-    Write-Output 'No models were downloaded. In agent chat onboard Fast-Tabber: disclose privacy, approve EmbeddingGemma if missing, verify embeddings, then confirm Chrome. Your existing agent supplies reasoning.'
+    Write-Output 'Use /fast-tabber list my tabs, or select Tabber. Selecting the Skill alone does not install MCP or switch agents.'
+    Write-Output 'No models were downloaded. In agent chat onboard Fast-Tabber: disclose privacy and confirm Chrome. Your existing agent supplies reasoning.'
     Write-Output "Existing Chrome pairing reused when available. First installation only: load $TabberRoot\extension in Chrome and approve its permissions."
 }
 $TabberExpectedVersion = (Get-Content -LiteralPath (Join-Path $TabberRoot 'extension\manifest.json') -Raw | ConvertFrom-Json).version

@@ -13,7 +13,7 @@ if ($Mode -eq 'setup') {
     exit $LASTEXITCODE
 }
 if ($Mode -eq 'check') {
-    & $TabberPython -m fast_tabber.preflight
+    & $TabberPython -m fast_tabber.probe
     exit $LASTEXITCODE
 }
 if ($Mode -eq 'serve') {

@@ -1,6 +1,6 @@
 {
   "name": "fast-tabber-toolkit",
-  "version": "0.7.1-preview.1",
+  "version": "1.0.0",
   "description": "Local-first Chrome tabs and bookmarks through MCP and your existing AI agent",
   "license": "MIT",
   "repository": {
@@ -18,7 +18,7 @@
   ],
   "publishConfig": {
     "access": "public",
-    "tag": "next"
+    "tag": "latest"
   },
   "files": [
     "cli.js",
@@ -42,10 +42,14 @@
     "PRIVACY.md",
     "fast_tabber/setup.html",
     "fast_tabber/setup-page.js",
-    "fast_tabber/setup-page.css"
+    "fast_tabber/setup-page.css",
+    ".agents/plugins/marketplace.json",
+    "plugins/fast-tabber/.codex-plugin/plugin.json",
+    "plugins/fast-tabber/.mcp.json",
+    "plugins/fast-tabber/skills/fast-tabber/SKILL.md"
   ],
   "scripts": {
-    "test": "node tests/test_extension.mjs && node tests/test_bookmarks.mjs && node tests/test_popup.mjs && node tests/test_pairing.mjs"
+    "test": "node tests/test_extension.mjs && node tests/test_bookmarks.mjs && node tests/test_popup.mjs && node tests/test_pairing.mjs && node tests/test_runtime.mjs"
   },
   "type": "module",
   "main": "./opencode-plugin.js",

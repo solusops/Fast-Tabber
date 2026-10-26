@@ -1,0 +1,20 @@
+{
+  "name": "fast-tabber",
+  "interface": {
+    "displayName": "Fast-Tabber"
+  },
+  "plugins": [
+    {
+      "name": "fast-tabber",
+      "source": {
+        "source": "local",
+        "path": "./plugins/fast-tabber"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

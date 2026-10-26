@@ -92,7 +92,7 @@ async def test_v2_groups_collections_duplicates_and_undo():
 
                     saved = await call("collection_action", {"action": "save", "name": collection_name, "tab_ids": opened})
                     assert saved["saved"] == 2
-                    closed = await call("collection_action", {"action": "close", "name": collection_name, "mode": "batch"})
+                    closed = await call("collection_action", {"action": "close", "name": collection_name, "mode": "batch", "confirmed": True})
                     assert closed["closed"] == 2 and closed["verified"]
                     assert not any(tab["id"] in opened for tab in (await tabs(window_id))["tabs"])
                     restored = await call("undo_last")
@@ -103,7 +103,7 @@ async def test_v2_groups_collections_duplicates_and_undo():
                     assert all(next(tab for tab in listing["tabs"] if tab["id"] == tab_id)["groupId"] >= 0 for tab_id in opened), \
                         f"restored IDs/group IDs: {[(tab_id, next(tab for tab in listing['tabs'] if tab['id'] == tab_id)['groupId']) for tab_id in opened]}; groups: {listing['groups']}"
 
-                    await call("collection_action", {"action": "close", "name": collection_name, "mode": "sequential"})
+                    await call("collection_action", {"action": "close", "name": collection_name, "mode": "sequential", "confirmed": True})
                     restored = await call("collection_action", {"action": "restore", "name": collection_name, "mode": "sequential"})
                     opened = restored.get("tabIds", [])
                     test_ids.update(opened)
@@ -112,7 +112,7 @@ async def test_v2_groups_collections_duplicates_and_undo():
                     assert all(next(tab for tab in listing["tabs"] if tab["id"] == tab_id)["groupId"] >= 0 for tab_id in opened)
                     await call("undo_last")
                     assert not any(tab["id"] in opened for tab in (await tabs(window_id))["tabs"])
-                    await call("collection_action", {"action": "delete", "name": collection_name})
+                    await call("collection_action", {"action": "delete", "name": collection_name, "confirmed": True})
 
                     duplicate_url = f"https://example.org/?fast_tabber_duplicate={marker}"
                     duplicate_ids = []
@@ -122,13 +122,13 @@ async def test_v2_groups_collections_duplicates_and_undo():
                         test_ids.add(result["tab"]["id"])
                     preview = await call("remove_duplicates", {"window_id": window_id})
                     assert preview["count"] == 1 and duplicate_ids[1] in preview["samples"]
-                    removed = await call("remove_duplicates", {"window_id": window_id, "remove": True})
+                    removed = await call("remove_duplicates", {"window_id": window_id, "remove": True, "confirmed": True})
                     assert removed["removed"] == 1 and not any(tab["id"] == duplicate_ids[1] for tab in (await tabs(window_id))["tabs"])
                     restored = await call("undo_last")
                     test_ids.update(restored.get("tabIds", []))
                     assert restored["restored"] == 1 and len(restored["tabIds"]) == 1
                     for tab_id in (duplicate_ids[0], restored["tabIds"][0]):
-                        await call("tab_action", {"action": "close", "tab_id": tab_id})
+                        await call("tab_action", {"action": "close", "tab_id": tab_id, "confirmed": True})
                     assert not any(tab["id"] in test_ids for tab in (await tabs(window_id))["tabs"])
                     assert active_id is None or next(tab for tab in (await tabs(window_id))["tabs"] if tab["id"] == active_id)["active"]
                 finally:
@@ -136,7 +136,7 @@ async def test_v2_groups_collections_duplicates_and_undo():
                         listing = await tabs(window_id)
                         present = {tab["id"] for tab in listing["tabs"]}
                         for tab_id in sorted(test_ids & present):
-                            await call("tab_action", {"action": "close", "tab_id": tab_id})
+                            await call("tab_action", {"action": "close", "tab_id": tab_id, "confirmed": True})
                     finally:
                         store = sqlite3.connect(STATE / "browser.sqlite3")
                         rows = store.execute("SELECT id,payload FROM undo WHERE id>?", (undo_before,)).fetchall()
@@ -150,4 +150,4 @@ async def test_v2_groups_collections_duplicates_and_undo():
                                 store.execute("DELETE FROM undo WHERE id=?", (entry_id,))
                         store.commit()
                         store.close()
-                        await client.call_tool("collection_action", {"action": "delete", "name": collection_name})
+                        await client.call_tool("collection_action", {"action": "delete", "name": collection_name, "confirmed": True})

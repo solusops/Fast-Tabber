@@ -7,7 +7,6 @@ import re
 import secrets
 import sys
 from pathlib import Path
-from fast_tabber.preflight import model_name
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -65,23 +64,7 @@ def prepare(root: Path = ROOT):
 
     config = {
         "$schema": "https://opencode.ai/config.json",
-        "enabled_providers": ["ollama"],
-        "autoupdate": False,
-        "share": "disabled",
-        "plugin": [],
         "skills": {"paths": [str(root / ".agents" / "skills")]},
-        "provider": {"ollama": {
-            "npm": "@ai-sdk/openai-compatible",
-            "name": "Ollama (local only)",
-            "options": {"baseURL": "http://127.0.0.1:11434/v1"},
-            "models": {model_name(): {
-                "name": "Gemma (selected local model)",
-                "limit": {"context": 16384, "output": 4096},
-                "tool_call": True,
-                "attachment": True,
-                "modalities": {"input": ["text", "image"], "output": ["text"]},
-            }},
-        }},
         "mcp": {"fast-tabber": {
             "type": "remote", "url": "http://127.0.0.1:8765/mcp", "oauth": False,
             "headers": {"Authorization": "Bearer {env:FAST_TABBER_TOKEN}"},
@@ -90,23 +73,7 @@ def prepare(root: Path = ROOT):
         "permission": {"*": "deny", "fast-tabber_browser_status": "allow", "fast-tabber_list_tabs": "allow",
                        "fast-tabber_*": "ask", "skill": {"*": "deny", "fast-tabber": "allow"}},
     }
-    # An existing explicit launcher preference is preserved; no model is selected or downloaded by the server.
-    settings_path = state / "settings.json"
-    selected = json.loads(settings_path.read_text()).get("model") if settings_path.exists() else None
-    if selected:
-        config["model"] = "ollama/" + selected
-        config["small_model"] = config["model"]
-    else:
-        config["provider"]["ollama"]["models"] = {}
     (state / "opencode.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    codex = root / ".codex"
-    codex.mkdir(exist_ok=True)
-    target = codex / "config.toml"
-    if not target.exists():
-        target.write_text(
-            '[mcp_servers.fast-tabber]\ncommand = "node"\nargs = [' + json.dumps(str(root / "cli.js")) + ', "mcp"]\n'
-            'startup_timeout_sec = 180\ntool_timeout_sec = 600\n', encoding="utf-8",
-        )
     return connection
 
 

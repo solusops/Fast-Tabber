@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "fast-tabber": {
+      "command": "npx.cmd",
+      "args": [
+        "-y",
+        "fast-tabber-toolkit@1.0.0",
+        "mcp"
+      ]
+    }
+  }
+}

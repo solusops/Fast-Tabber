@@ -17,7 +17,7 @@ async function probe() {
     connected: true,
     windowCount: windows.filter(window => !window.incognito).length,
     windows: windows.filter(window => !window.incognito).slice(0, 20).map(window => ({ id: window.id, state: window.state, focused: window.focused })),
-    tabCount: tabs.filter(tab => !tab.incognito).length,
+    tabCount: tabs.filter(tab => !tab.incognito && !inspectionTabs.has(tab.id)).length,
     permissions: permissions.permissions,
     extensionVersion: chrome.runtime.getManifest().version,
     stage: "v5",
@@ -54,7 +54,7 @@ async function getTabIfPresent(id) {
 
 async function listTabs({ windowId, offset = 0, limit = 20 }) {
   const tabs = await chrome.tabs.query(windowId == null ? { windowType: "normal" } : { windowId });
-  const normal = tabs.filter(tab => !tab.incognito);
+  const normal = tabs.filter(tab => !tab.incognito && !inspectionTabs.has(tab.id));
   const page = normal.slice(offset, offset + limit);
   const groupIds = [...new Set(page.map(tab => tab.groupId).filter(id => id >= 0))];
   const groups = await Promise.all(groupIds.map(async id => {
@@ -71,9 +71,10 @@ async function captureTabs(tabIds) {
   const tabs = [];
   const groups = {};
   for (const id of [...new Set(tabIds)]) {
+    if (inspectionTabs.has(id)) throw new Error("Temporary inspection tabs cannot be saved or changed");
     const tab = await chrome.tabs.get(id);
     if (tab.incognito || !tab.url) throw new Error("Incognito or inaccessible tabs cannot be saved or changed");
-    tabs.push({ id, windowId: tab.windowId, index: tab.index, url: tab.url, title: (tab.title || "").slice(0, 200), discarded: Boolean(tab.discarded), active: tab.active,
+    tabs.push({ id, windowId: tab.windowId, index: tab.index, url: tab.url, title: (tab.title || "").slice(0, 200), status: tab.status, discarded: Boolean(tab.discarded), active: tab.active,
       pinned: tab.pinned, groupId: tab.groupId });
     if (tab.groupId >= 0 && !groups[tab.groupId]) {
       const group = await chrome.tabGroups.get(tab.groupId);
@@ -337,7 +338,7 @@ async function closeSavedCollection({ tabIds, mode = "batch" }) {
 
 async function findDuplicates({ windowId, remove = false, mode = "batch" }) {
   const tabs = (await chrome.tabs.query(windowId == null ? { windowType: "normal" } : { windowId }))
-    .filter(tab => !tab.incognito && /^https?:\/\//i.test(tab.url || ""));
+    .filter(tab => !tab.incognito && !inspectionTabs.has(tab.id) && /^https?:\/\//i.test(tab.url || ""));
   const seen = new Set();
   const duplicates = [];
   for (const tab of tabs) {
@@ -352,26 +353,15 @@ async function findDuplicates({ windowId, remove = false, mode = "batch" }) {
 async function extractTabs({ tabIds, windowId, wakeSleeping = false }) {
   const tabs = tabIds ? await Promise.all(tabIds.map(id => chrome.tabs.get(id))) :
     await chrome.tabs.query({ windowType: "normal", ...(windowId == null ? {} : { windowId }) });
-  const normal = tabs.filter(tab => !tab.incognito);
+  const normal = tabs.filter(tab => !tab.incognito && (tabIds || !inspectionTabs.has(tab.id)));
   if (normal.length > 500) throw new Error("Text extraction is limited to 500 tabs per request");
   if (wakeSleeping) {
     const combined = { items: [], failures: [] };
     for (const tab of normal) {
-      if (!/^https?:\/\//i.test(tab.url || "") || new URL(tab.url).username || new URL(tab.url).password)
-        throw new Error("Only ordinary web tabs without embedded credentials can be extracted");
       try {
-        if (tab.discarded) {
-          await chrome.tabs.reload(tab.id);
-          await waitForLoad(tab.id);
-        }
-        const result = await extractTabs({ tabIds: [tab.id] });
-        combined.items.push(...result.items);
-        combined.failures.push(...result.failures);
-      } finally {
-        if (tab.discarded && !(await chrome.tabs.get(tab.id)).discarded) {
-          await chrome.tabs.discard(tab.id);
-          if (!(await chrome.tabs.get(tab.id)).discarded) throw new Error("Text extraction could not restore sleeping state");
-        }
+        combined.items.push(await inspectPage({ tabId: tab.id, detail: "text" }));
+      } catch (error) {
+        combined.failures.push({ id: tab.id, reason: String(error.message || error).slice(0, 160) });
       }
     }
     return combined;
@@ -379,23 +369,33 @@ async function extractTabs({ tabIds, windowId, wakeSleeping = false }) {
   const items = [];
   const failures = [];
   const extract = () => {
-    const headings = [...document.querySelectorAll("h1,h2,h3")].map(node => (node.innerText || node.textContent || "").trim())
-      .filter(Boolean).slice(0, 10).map(value => value.slice(0, 120));
-    const root = document.querySelector("main,article,[role=main]") || document.body;
-    const copy = root.cloneNode(true);
-    copy.querySelectorAll("script,style,noscript,nav,footer,header,form,input,textarea,select,button,svg,[aria-hidden=true],[contenteditable=true]")
-      .forEach(node => node.remove());
-    const walker = document.createTreeWalker(copy, NodeFilter.SHOW_TEXT);
+    const root = document.querySelector("article,[itemprop=articleBody]") || document.querySelector("[role=main]") ||
+      document.querySelector("main") || document.body;
+    const headings = [];
+    for (const node of root.querySelectorAll("h1,h2,h3")) {
+      const value = (node.innerText || node.textContent || "").trim();
+      if (value) headings.push(value.slice(0, 120));
+      if (headings.length === 10) break;
+    }
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     const chunks = [];
     let previousBlock;
-    while (walker.nextNode()) {
-      const block = walker.currentNode.parentElement.closest("address,article,blockquote,dd,div,dl,dt,figure,h1,h2,h3,h4,li,main,ol,p,pre,section,table,td,tr,ul") || copy;
-      if (block !== previousBlock) chunks.push(" ");
-      chunks.push(walker.currentNode.nodeValue);
+    let size = 0;
+    let visited = 0;
+    while (visited < 5000 && size < 12000 && walker.nextNode()) {
+      visited++;
+      const node = walker.currentNode;
+      const parent = node.parentElement;
+      if (!parent || parent.closest("script,style,noscript,nav,aside,footer,header,form,input,textarea,select,button,svg,dialog,[role=navigation],[role=complementary],[role=contentinfo],[role=banner],[role=menu],[role=menubar],[aria-hidden=true],[contenteditable=true]")) continue;
+      const value = node.nodeValue.replace(/\s+/g, " ").trim();
+      if (!value) continue;
+      const block = parent.closest("address,article,blockquote,dd,div,dl,dt,figure,h1,h2,h3,h4,li,main,ol,p,pre,section,table,td,tr,ul") || root;
+      const part = (block !== previousBlock ? " " : "") + value.slice(0, 12000 - size);
+      chunks.push(part);
+      size += part.length;
       previousBlock = block;
     }
-    const text = chunks.join("").replace(/\s+/g, " ").trim().slice(0, 12000);
-    return { title: document.title.slice(0, 200), headings, text };
+    return { title: document.title.slice(0, 200), headings, text: chunks.join("").trim() };
   };
   for (let offset = 0; offset < normal.length; offset += 8) {
     await Promise.all(normal.slice(offset, offset + 8).map(async tab => {
@@ -408,7 +408,7 @@ async function extractTabs({ tabIds, windowId, wakeSleeping = false }) {
         return;
       }
       try {
-        const [{ result }] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract });
+        const [{ result }] = await executeScriptBounded(tab.id, extract, 20000, "text extraction");
         if (!result || !result.text && !result.headings.length) {
           failures.push({ id: tab.id, reason: "no_rendered_text" });
           return;
@@ -419,8 +419,12 @@ async function extractTabs({ tabIds, windowId, wakeSleeping = false }) {
         }
         items.push({ id: tab.id, windowId: tab.windowId, url: tab.url, title: result.title, headings: result.headings, text: result.text });
       } catch (error) {
-        failures.push({ id: tab.id, reason: /permission/i.test(error.message || "")
-          ? "missing_site_permission" : "inaccessible_page" });
+        const message = String(error?.message || "");
+        const reason = /timed out/i.test(message) ? "text_extraction_timed_out"
+          : /permission|cannot access|cannot be scripted|host permission/i.test(message) ? "missing_site_permission"
+          : /frame.*(removed|not found)|no tab with id/i.test(message) ? "page_unavailable"
+          : "text_extraction_failed";
+        failures.push({ id: tab.id, reason });
       }
     }));
   }
@@ -545,7 +549,7 @@ async function capturePage({ tabId }) {
 }
 
 async function groupCategories({ categories, mode = "batch", expectedUrls = {} }) {
-  if (!Array.isArray(categories) || !categories.length || categories.length > 20) throw new Error("Provide 1 to 20 categories");
+  if (!Array.isArray(categories) || !categories.length || categories.length > 100) throw new Error("Provide 1 to 100 categories");
   if (!["batch", "sequential"].includes(mode)) throw new Error("mode must be batch or sequential");
   const used = new Set();
   const groups = [];
@@ -787,7 +791,7 @@ async function connect() {
           capture_tabs: ({ tabIds }) => captureTabs(tabIds || []), find_duplicates: findDuplicates,
           extract_tabs: extractTabs, filter_tabs: filterTabs, group_categories: groupCategories, capture_page: capturePage,
           reload_extension: () => { setTimeout(() => chrome.runtime.reload(), 500); return { scheduled: true }; },
-          capture_browser: async () => captureTabs((await chrome.tabs.query({ windowType: "normal" })).filter(tab => !tab.incognito).map(tab => tab.id)),
+          capture_browser: async () => captureTabs((await chrome.tabs.query({ windowType: "normal" })).filter(tab => !tab.incognito && !inspectionTabs.has(tab.id)).map(tab => tab.id)),
           restore_collection: restoreCollection, bookmark_tree: bookmarkTree, bookmark_action: bookmarkAction,
           restore_bookmarks: restoreBookmarks, inspect_page: inspectPage };
         if (!handlers[message.operation]) throw new Error("Browser operation is not enabled");

@@ -60,19 +60,16 @@ def test_tab_tools_are_bounded_and_task_oriented():
             "authorization": f"Bearer {TOKEN}", "accept": "application/json, text/event-stream",
             "mcp-protocol-version": "2025-11-25",
         }, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
-        assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
-            "browser_status", "browser_setup", "list_tabs", "tab_action", "organize_tabs",
-            "collection_action", "remove_duplicates", "undo_last", "index_tabs",
-            "search_tabs", "organize_by_text", "local_data", "catalogue_tabs", "onboarding",
-            "list_resources", "index_resources", "search_resources", "group_resources", "group_plan",
-            "bookmark_action", "find_duplicates", "export_urls", "inspect_page", "apply_grouping",
-        }
+        names = {tool["name"] for tool in response.json()["result"]["tools"]}
+        assert {"index_resources", "search_resources", "group_selections", "tab_selection", "selection_action"} <= names
+        assert not {"group_plan", "apply_grouping", "group_resources", "organize_by_text", "index_tabs", "catalogue_tabs"} & names
         tool = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "list_tabs")
         assert tool["inputSchema"]["properties"]["limit"]["maximum"] == 100
         tools = {item["name"]: item for item in response.json()["result"]["tools"]}
-        assert tools["index_tabs"]["annotations"]["readOnlyHint"] is False
-        assert tools["search_tabs"]["inputSchema"]["properties"]["mode"]["default"] == "keyword"
-        assert tools["group_resources"]["inputSchema"]["properties"]["mode"]["default"] == "fast"
+        assert tools["index_resources"]["inputSchema"]["properties"]["level"]["default"] == "text"
+        assert "mode" not in tools["search_resources"]["inputSchema"]["properties"]
+        assert tools["selection_action"]["inputSchema"]["properties"]["limit"]["maximum"] == 100
+
 
 
 def test_list_tabs_rejects_invalid_pagination():
@@ -162,3 +159,15 @@ async def test_timeout_does_not_retry():
 async def test_text_extraction_is_enabled_for_local_processing():
     with pytest.raises(RuntimeError, match="Chrome extension is disconnected"):
         await Bridge().call("extract_tabs")
+
+
+async def test_bookmark_undo_reaches_the_browser_bridge():
+    bridge = Bridge()
+    sent = []
+    class Peer:
+        async def send_json(self, value):
+            sent.append(value)
+            bridge.pending[value["id"]].set_result({"restored": 2, "bookmarkIds": {}})
+    bridge.peer = Peer()
+    result = await bridge.call("restore_bookmarks", {"bookmarkBefore": []})
+    assert result["restored"] == 2 and sent[0]["operation"] == "restore_bookmarks"

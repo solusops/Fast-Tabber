@@ -62,16 +62,3 @@ def test_page_index_handles_five_hundred_records(tmp_path):
         "title": "Notes", "headings": [], "text": f"shared research record {i}"} for i in range(500)])
     assert store.count_pages("shared research") == 500
     assert len(store.search_pages("shared research", 0, 100)) == 100
-
-
-def test_embeddings_persist_cache_and_rank_semantically(tmp_path):
-    store = StateStore(tmp_path / "browser.sqlite3")
-    pages = [{"id": 1, "windowId": 1, "url": "https://robot.test/", "title": "Robot learning",
-              "headings": [], "text": "Learn manipulation from visual demonstrations."},
-             {"id": 2, "windowId": 1, "url": "https://school.test/", "title": "College",
-              "headings": [], "text": "University admissions and applications."}]
-    changed = store.save_pages(pages, "embedding-digest-a")
-    store.save_embeddings(changed, [[1.0, 0.0], [0.0, 1.0]], "embedding-digest-a")
-    assert store.save_pages(pages, "embedding-digest-a") == []
-    assert store.semantic_search([0.9, 0.1], 0, 1, "embedding-digest-a")[0][0]["id"] == 1
-    assert len(store.save_pages(pages, "embedding-digest-b")) == 2

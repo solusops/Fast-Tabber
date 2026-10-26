@@ -1,10 +1,22 @@
 import json
 import subprocess
 import sys
+import re
+from pathlib import Path
 
 import pytest
 
 from fast_tabber.setup import prepare
+
+
+def test_installer_copies_every_packaged_runtime_asset():
+    project = Path(__file__).resolve().parent.parent
+    source = (project / "install.ps1").read_text()
+    files = re.search(r"foreach \(\$TabberFile in @\((.*?)\)\)", source).group(1)
+    copied = {value.replace("\\", "/") for value in re.findall(r"'([^']+)'", files)}
+    copied.update(path.relative_to(project).as_posix() for path in (project / "fast_tabber").glob("*.py"))
+    expected = {path.relative_to(project).as_posix() for pattern in json.loads((project / "package.json").read_text())["files"] for path in project.glob(pattern)}
+    assert expected <= copied, "Installer misses packaged runtime assets: " + str(expected - copied)
 
 
 def root(tmp_path):

@@ -1,0 +1,12 @@
+{
+  "name": "fast-tabber",
+  "version": "1.0.0",
+  "description": "Local-first Chrome tabs and bookmarks through MCP and your existing AI agent",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Fast-Tabber",
+    "shortDescription": "Tabs, bookmarks, cached search and bulk organization",
+    "category": "Productivity"
+  }
+}
