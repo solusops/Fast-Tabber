@@ -6,7 +6,7 @@ Chrome tab management inside OpenCode or Codex: an authenticated local MCP serve
 
 Prerequisites: Chrome 120+, OpenCode, [uv](https://docs.astral.sh/uv/getting-started/installation/), and [Ollama](https://ollama.com/download).
 
-Ollama must bind to loopback with `OLLAMA_CONTEXT_LENGTH=32768`; restart an existing Ollama service after changing these settings. The installer uses them when it starts Ollama and verifies the actual OpenCode-compatible tool/result round trip. No model substitution is used.
+Ollama must bind to loopback with `OLLAMA_CONTEXT_LENGTH=32768`; restart an existing Ollama service after changing these settings. The installer uses them when starting Ollama. Model verification during chat onboarding checks the actual OpenCode-compatible tool/result round trip. No model substitution is used.
 
 Give the release ZIP to OpenCode's **Build** agent and ask it to extract it, read this README, and run:
 
@@ -14,7 +14,9 @@ Give the release ZIP to OpenCode's **Build** agent and ask it to extract it, rea
 <extracted-folder>\install.cmd -Workspace <your-project-folder>
 ```
 
-The installer creates the Python environment, installs pinned dependencies, downloads `gemma4:e2b` and `embeddinggemma-2:740m` if missing, verifies text/tool/vision/image-embedding execution, and starts the loopback MCP service. It adds a project plugin without replacing existing agent configurations. A shared runtime registry at `~/.fast-tabber/runtime.json` lets other OpenCode installations reuse the same service, data, and Chrome pairing.
+The installer creates the Python environment, installs pinned dependencies and starts the loopback MCP service. **It never downloads models.** It adds a project plugin without replacing existing agent configurations. A shared runtime registry at `~/.fast-tabber/runtime.json` lets other OpenCode installations reuse the same service, data, and Chrome pairing.
+
+In your already working agent chat, ask `/tabs set up Fast-Tabber`. The agent explains model roles and asks which local Gemma tag to use, including installed options. Each missing model needs its own yes before a download starts; installed models are reused. The embedding model is `embeddinggemma-2:740m`. Download progress and actual inference verification are checked through MCP. After model selection/verification, restart OpenCode to use that model in Tabber. Initial onboarding uses your existing working chat model; it cannot bootstrap a local agent that has no usable inference model.
 
 Require a successful installer exit, then restart OpenCode in that project and use `/tabs list my tabs`, select **Tabber**, or run `opencode --agent tabber`. Selecting the Skill alone does not install MCP or switch agents. Prompt normally: “Organize my browser”, “Find tabs about robotics”, “Save these tabs”, or “Revert last change”. The Tabber agent allows MCP tools and questions; shell, file editing, and other tools are denied. Use Build for installation or upgrades.
 
@@ -22,7 +24,7 @@ Require a successful installer exit, then restart OpenCode in that project and u
 
 First installation only: open `chrome://extensions`, enable Developer mode, and load the runtime's `extension` folder unpacked. Approve Chrome's permissions. The installer prints the exact path. Normal Chrome installations cannot silently install or approve extensions.
 
-Detection uses an authenticated extension connection, not a process-name guess. If disconnected, MCP tells the agent the exact folder and required user step. Another agent installation on the same machine/user can reuse it; a different Chrome profile needs its own extension approval. Background alarms reconnect after service restarts.
+Detection uses an authenticated extension connection, not a process-name guess. Onboarding checks it live. If disconnected, the agent shows the exact folder and browser setup steps, waits for your chat reply, then checks again. A reply alone never marks pairing successful. Another agent installation on the same machine/user can reuse it; a different Chrome profile needs its own extension approval. Background alarms reconnect after service restarts.
 
 ## Scope and local data
 

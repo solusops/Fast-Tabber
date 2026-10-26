@@ -66,14 +66,7 @@ try { $TabberModels = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -
     if (!$TabberModels) { throw 'Ollama did not start on loopback.' }
 }
 if (Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue | Where-Object LocalAddress -NotIn @('127.0.0.1','::1')) { throw 'Ollama must bind only to loopback; configure OLLAMA_HOST=127.0.0.1:11434 and restart it.' }
-foreach ($TabberModel in @('gemma4:e2b','embeddinggemma-2:740m')) {
-    if ($TabberModel -notin $TabberModels.models.name) {
-        if ($StartOnly) { throw "Required model missing: $TabberModel. Run installation again; no substitute is permitted." }
-        Invoke-TabberCommand $TabberOllama @('pull',$TabberModel)
-    }
-}
 if (!$StartOnly) {
-    Invoke-TabberCommand $TabberPython @('-m','fast_tabber.preflight')
     $TabberHealth = Get-TabberHealth
     if ($TabberHealth) {
         if ($TabberHealth.busy) { throw 'Fast-Tabber became busy; finish its operation and retry installation.' }
@@ -102,6 +95,7 @@ if (!$StartOnly) {
     [IO.File]::WriteAllText($TabberEntry, "// Fast-Tabber managed entry`nexport { FastTabberPlugin } from $TabberModule;`n", (New-Object Text.UTF8Encoding($false)))
     Write-Output "Installed MCP server + Skill. Restart OpenCode in: $Workspace"
     Write-Output 'Use /tabs list my tabs, or select Tabber. Selecting the Skill alone does not install MCP or switch agents.'
+    Write-Output 'No models were downloaded. In agent chat ask Fast-Tabber to onboard: select your local model, approve each missing download separately, verify models, then confirm Chrome pairing.'
     Write-Output "Existing Chrome pairing reused when available. First installation only: load $TabberRoot\extension in Chrome and approve its permissions."
 }
 $TabberExpectedVersion = (Get-Content -LiteralPath (Join-Path $TabberRoot 'extension\manifest.json') -Raw | ConvertFrom-Json).version

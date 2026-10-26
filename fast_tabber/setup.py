@@ -7,6 +7,7 @@ import re
 import secrets
 import sys
 from pathlib import Path
+from fast_tabber.preflight import model_name
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -68,8 +69,8 @@ def prepare(root: Path = ROOT):
 
     config = {
         "$schema": "https://opencode.ai/config.json",
-        "model": "ollama/gemma4:e2b",
-        "small_model": "ollama/gemma4:e2b",
+        "model": "ollama/" + model_name(),
+        "small_model": "ollama/" + model_name(),
         "enabled_providers": ["ollama"],
         "autoupdate": False,
         "share": "disabled",
@@ -79,8 +80,8 @@ def prepare(root: Path = ROOT):
             "npm": "@ai-sdk/openai-compatible",
             "name": "Ollama (local only)",
             "options": {"baseURL": "http://127.0.0.1:11434/v1"},
-            "models": {"gemma4:e2b": {
-                "name": "Gemma 4 E2B (local)",
+            "models": {model_name(): {
+                "name": "Gemma (selected local model)",
                 "limit": {"context": 16384, "output": 4096},
                 "tool_call": True,
                 "attachment": True,

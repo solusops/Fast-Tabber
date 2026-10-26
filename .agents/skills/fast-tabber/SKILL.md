@@ -6,6 +6,14 @@ license: MIT
 
 Requires the installed MCP server, paired Chrome extension, and configured local Ollama models. Use the connected Fast-Tabber MCP tools for browser access. Loading this Skill provides instructions, not a connection. If the tools are absent, report incomplete installation and direct the user to the README setup. Do not replace them with shell scripts, direct browser internals, or Computer Use.
 
+## Onboarding
+
+Call `onboarding(action="status")` to show the selected model, installed alternatives, missing dependencies and verification state. Ask which local Gemma model the user wants; select its exact tag with `action="select_model"`. Do not impose a model size or substitute another model.
+
+For each missing model, explain its purpose and potentially multi-GB download. Ask separately and wait for yes to that exact model before `onboarding(action="download", model=..., confirm=true)`. A no leaves it undownloaded; report which capabilities remain unavailable. Poll status until the download completes, then offer the next required download. Installed models need no download. Use `action="verify"` after prerequisites are present; poll and report actual results.
+
+Call `onboarding(action="browser")` for a live connection check. On failure, show its extension path and setup steps, then wait for the user to reply in chat. After the reply call it again; continue only after `connected=true, verified=true`. A reply alone is not evidence. The first onboarding conversation uses the user's existing working agent/model; restart OpenCode after selecting and verifying a different chat model.
+
 ## Discover and act
 
 - Resolve tabs with `list_tabs` or `search_tabs`; users need not know IDs. Results default to 20, maximum 100. Fetch another page only when needed; advance `offset` rather than repeating the same request.
@@ -14,7 +22,7 @@ Requires the installed MCP server, paired Chrome extension, and configured local
 
 ## Organize a collection
 
-1. Ask the user to choose **Simple** (rendered text and cache, no screenshots) or **Rigorous** (text first, screenshots for unresolved tabs; may activate Chrome), unless they already chose. Wait for the answer. Start `catalogue_tabs(processing="simple"|"rigorous")` with the user's exact instruction and optional categories; omit IDs for the whole browser. Preserve requests such as “as few coherent groups as possible”; do not invent categories from URLs. Sleeping pages without cached text are loaded one at a time in the background for text extraction. Checkpoints and recovery collections use batches of 50.
+1. Ask the user to choose **Simple** (rendered text and cache, no screenshots) or **Rigorous** (text first, screenshots for unresolved tabs; may activate Chrome), unless they already chose. Wait for the answer. Pass the user's instruction unchanged to `catalogue_tabs(processing="simple"|"rigorous")`. Supply categories only if the user named them; otherwise omit them and let the local model infer categories from the selected content. Do not assume sites, subjects, group counts, or a grouping style from examples or previous users. Omit IDs for the whole browser. Sleeping pages without cached text are loaded individually in the background. Checkpoints and recovery collections use batches of 50.
 2. Poll `action="status", wait_seconds=30` with the job ID. Report progress while running. Use `resume` after interruption; stop on failure. Avoid per-tab agent calls.
 3. After completion, call `action="apply"` to apply saved classifications in native batch mode, then report the verified result. Sequential demonstrations are paused.
 

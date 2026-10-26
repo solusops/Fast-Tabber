@@ -33,7 +33,8 @@ from fast_tabber.text import triage_pages
 from fast_tabber.semantic import cluster_vectors, cosine, embed_texts, embedding_digest
 from fast_tabber.vision import describe_image
 from fast_tabber.index import ContentIndex
-from fast_tabber.preflight import GEMMA, OLLAMA
+from fast_tabber.onboarding import Onboarding
+from fast_tabber.preflight import OLLAMA
 
 STATE = Path(__file__).resolve().parent.parent / ".state"
 
@@ -395,6 +396,8 @@ def create_app(token: str, origin: str, database: Path | None = None):
     processing_lock = asyncio.Lock()
     catalogue_control_lock = asyncio.Lock()
     catalogue_tasks = {}
+    setup = Onboarding(STATE, bridge, lambda: processing_lock.locked() or operation_lock.locked()
+                       or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values()), processing_lock)
     def serialized(lock):
         def decorate(function):
             @wraps(function)
@@ -405,7 +408,25 @@ def create_app(token: str, origin: str, database: Path | None = None):
         return decorate
     serialized_processing = serialized(processing_lock)
     serialized_catalogue = serialized(catalogue_control_lock)
-    mcp = MCPServer("fast-tabber", version="0.5.2", instructions="Manage, search, and organize Chrome tabs with local Gemma text, vision, and semantic embeddings.")
+    mcp = MCPServer("fast-tabber", version="0.5.3", instructions="Manage, search, and organize Chrome tabs with local Gemma text, vision, and semantic embeddings.")
+
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, open_world_hint=True))
+    async def onboarding(action: Literal["status", "select_model", "download", "verify", "browser"] = "status",
+                         model: str = "", confirm: bool = False) -> dict[str, Any]:
+        """Interactive setup: inspect prerequisites, select the user's local model, approve each exact download, verify inference, and confirm the live Chrome connection after the user replies."""
+        if action == "browser":
+            try:
+                status = await bridge.call("probe")
+                return {"connected": True, "verified": True, "extensionVersion": status["extensionVersion"],
+                        "tabCount": status["tabCount"], "nextStep": "Browser pairing confirmed; continue the user's request."}
+            except RuntimeError as error:
+                return {"connected": False, "verified": False, "error": str(error),
+                        "extensionFolder": str(STATE.parent / "extension"),
+                        "steps": ["Open your normal Chrome profile", "Open chrome://extensions and enable Developer mode",
+                                  "If Fast-Tabber is absent, Load unpacked using extensionFolder; otherwise enable/reload it",
+                                  "Approve any requested permissions", "Reply in this agent chat when ready; the agent must call onboarding(action='browser') again"],
+                        "awaitingUserReply": True}
+        return await setup.call(action, model, confirm)
 
     async def mutate(operation: str, arguments: dict, collection_name: str | None = None):
         async with operation_lock:
@@ -1039,7 +1060,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         await bridge.connect(socket, token, origin)
 
     async def health(request):
-        return JSONResponse({"name": "fast-tabber", "version": "0.5.2", "root": str(STATE.parent),
+        return JSONResponse({"name": "fast-tabber", "version": "0.5.3", "root": str(STATE.parent),
             "connected": bridge.peer is not None, "extensionVersion": bridge.extension_version, "pid": os.getpid(),
             "busy": operation_lock.locked() or processing_lock.locked() or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values())})
 

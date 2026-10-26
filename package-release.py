@@ -10,7 +10,7 @@ files = [root / name for name in (
     "extension/manifest.json", "extension/background.js",
     ".agents/skills/fast-tabber/SKILL.md",
 )] + sorted((root / "fast_tabber").glob("*.py"))
-target = root / "dist" / "fast-tabber-0.5.2-preview.3.zip"
+target = root / "dist" / "fast-tabber-0.5.3-preview.4.zip"
 target.parent.mkdir(exist_ok=True)
 with ZipFile(target, "w", ZIP_DEFLATED) as archive:
     for path in files:

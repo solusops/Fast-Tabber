@@ -23,6 +23,8 @@ if ($Mode -eq 'serve') {
 $TabberConnection = Get-Content -LiteralPath '.state\connection.json' -Raw | ConvertFrom-Json
 $env:FAST_TABBER_TOKEN = $TabberConnection.token
 if ($Mode -eq 'local') {
+    & $TabberPython -m fast_tabber.setup
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:OPENCODE_CONFIG = Join-Path $PSScriptRoot '.state\opencode.json'
     $env:XDG_CONFIG_HOME = Join-Path $PSScriptRoot '.state\agent-config'
     $env:OPENCODE_DISABLE_AUTOUPDATE = 'true'

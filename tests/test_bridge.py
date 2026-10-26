@@ -32,7 +32,7 @@ def test_status_tool_advertises_safe_read_only_behavior():
             "accept": "application/json, text/event-stream",
             "mcp-protocol-version": "2025-11-25",
         }, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
-        tool = response.json()["result"]["tools"][0]
+        tool = next(item for item in response.json()["result"]["tools"] if item["name"] == "browser_status")
         assert tool["annotations"]["readOnlyHint"] is True
         assert tool["annotations"]["destructiveHint"] is False
 
@@ -63,7 +63,7 @@ def test_tab_tools_are_bounded_and_task_oriented():
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
             "browser_status", "browser_setup", "list_tabs", "tab_action", "organize_tabs",
             "collection_action", "remove_duplicates", "undo_last", "index_tabs",
-            "search_tabs", "organize_by_text", "local_data", "catalogue_tabs",
+            "search_tabs", "organize_by_text", "local_data", "catalogue_tabs", "onboarding",
         }
         tool = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "list_tabs")
         assert tool["inputSchema"]["properties"]["limit"]["maximum"] == 100

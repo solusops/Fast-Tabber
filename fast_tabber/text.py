@@ -6,7 +6,7 @@ from pathlib import Path
 
 import httpx
 
-from fast_tabber.preflight import GEMMA, OLLAMA, require_models
+from fast_tabber.preflight import model_name, OLLAMA, require_models
 
 CONTEXT = 16384
 MAX_OUTPUT = 8192
@@ -61,13 +61,15 @@ def validate_cluster_labels(payload: dict, cluster_ids: list[int]):
 
 
 async def _gemma_digest(client, state: Path):
-    recorded = json.loads((state / "models.json").read_text(encoding="utf-8-sig"))["models"][GEMMA]
+    recorded = json.loads((state / "models.json").read_text(encoding="utf-8-sig"))["models"].get(model_name())
+    if not recorded:
+        raise RuntimeError("The selected local model has not passed verification; run onboarding(action='verify') and check its result")
     tags_response = await client.get("/api/tags")
     tags_response.raise_for_status()
-    digest = require_models(tags_response.json())[GEMMA]
+    digest = require_models(tags_response.json())[model_name()]
     if digest != recorded:
         raise RuntimeError("Installed Gemma digest differs from the verified preflight model; re-run tabber.ps1 check")
-    info = await client.post("/api/show", json={"model": GEMMA})
+    info = await client.post("/api/show", json={"model": model_name()})
     info.raise_for_status()
     if True not in info.json().get("thinking", {}).get("values", []):
         raise RuntimeError("Ollama must support thinking for the verified Gemma model; upgrade/check the local runtime")
@@ -91,7 +93,7 @@ async def json_chat(client, prompt, schema, task, output_tokens=MAX_OUTPUT, imag
     size = len(prompt.encode("utf-8")) + len(json.dumps(schema, ensure_ascii=False).encode("utf-8"))
     if size > CONTEXT - MAX_OUTPUT - (4096 if images else 512):
         raise ValueError(f"{task} exceeds the structured input budget; no tabs were changed")
-    response = await client.post("/api/chat", json={"model": GEMMA, "stream": False, "think": True,
+    response = await client.post("/api/chat", json={"model": model_name(), "stream": False, "think": True,
         "format": schema, "options": {"temperature": 0, "num_ctx": CONTEXT, "num_predict": output_tokens},
         "messages": [{"role": "user", "content": prompt, **({"images": images} if images else {})}]})
     response.raise_for_status()
@@ -173,7 +175,7 @@ async def classify_pages(pages: list[dict], instruction: str, categories: list[s
                           "For visual pages, first name the primary depicted subject in subject, then choose its category. "
                           "Classify foreground objects or main media content, not incidental background scenery or webpage layout. "
                           "Previously inferred labels are suggestions; add a new label when the primary subject differs.\n"
-                          "When the request asks for few groups, prefer coherent broad categories and reuse them; do not create a group per narrow topic.\n"
+                          "Follow the user's requested grouping criteria and granularity. Infer labels from supplied evidence when none are specified.\n"
                           f"Request: {instruction}\nCategories: {categories or 'infer concise subject categories'}\n"
                           f"Previously inferred labels: {sorted(known)}. Reuse a label for the same subject; add one for a distinct subject.\n"
                           f"Pages: {json.dumps(evidence, ensure_ascii=False)}")

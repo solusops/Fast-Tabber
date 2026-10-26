@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import math
+import re
 import struct
 import zlib
 from pathlib import Path
@@ -12,11 +13,24 @@ from pathlib import Path
 import httpx
 
 OLLAMA = "http://127.0.0.1:11434"
-GEMMA = "gemma4:e2b"
+SETTINGS = Path(__file__).resolve().parent.parent / ".state" / "settings.json"
+
+
+def model_name(path=None):
+    path = path or SETTINGS
+    settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    name = settings.get("model", "gemma4:e2b")
+    if not re.fullmatch(r"gemma4:[a-zA-Z0-9_.-]+", name) or "cloud" in name.lower():
+        raise ValueError("Select an explicit local gemma4 model tag")
+    return name
+
+
+GEMMA = "gemma4:e2b"  # Compatibility export; runtime inference uses model_name().
 EMBEDDING = "embeddinggemma-2:740m"
 
 
 def require_models(payload: dict) -> dict[str, str]:
+    GEMMA = model_name()
     available = {model["name"]: model.get("digest") for model in payload["models"]}
     for name in (GEMMA, EMBEDDING):
         if name not in available:
@@ -63,6 +77,7 @@ async def pull_embeddings(client):
 
 
 async def check_models(client):
+    GEMMA = model_name()
     digests = require_models(await request(client, "/api/tags"))
     capabilities = {}
     for name, required in ((GEMMA, {"completion", "tools", "vision"}), (EMBEDDING, {"embedding", "vision"})):
