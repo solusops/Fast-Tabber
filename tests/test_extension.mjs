@@ -48,3 +48,18 @@ assert.equal(active, 8, "Capture failure must restore the previous active tab");
 assert.equal(scripts, 2, "Capture failure must remove page masks and restore scroll");
 assert.equal(detached, true, "Capture must release its debugger attachment on failure");
 console.log("Capture prerequisite and failure-restoration checks passed");
+
+let sleeping = true;
+let reloads = 0;
+context.chrome.tabs.get = async id => ({ id, windowId: 1, discarded: sleeping, url: "https://example.com/", incognito: false });
+context.chrome.tabs.reload = async () => { reloads++; sleeping = false; };
+context.chrome.tabs.discard = async () => { sleeping = true; };
+context.chrome.tabs.update = async () => { throw new Error("Text-only extraction must not activate a tab"); };
+context.chrome.windows.update = async () => { throw new Error("Text-only extraction must not change window state"); };
+context.chrome.scripting.executeScript = async () => [{ result: { title: "Research", headings: ["Notes"], text: "Rendered page text" } }];
+const extractTabs = vm.runInContext("extractTabs", context);
+const textResult = await extractTabs({ tabIds: [9], wakeSleeping: true });
+assert.equal(textResult.items.length, 1);
+assert.equal(reloads, 1);
+assert.equal(sleeping, true);
+console.log("Sleeping-page text extraction does not focus or resize Chrome");

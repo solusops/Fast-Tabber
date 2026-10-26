@@ -89,7 +89,7 @@ async def test_v4_body_semantic_search_and_gemma_groups(local_pages, mode):
                     assert len({tab["id"] for tab in semantic["tabs"][:4]} & relevant) == 2
                     grouped = await call("organize_by_text", {
                         "instruction": "Separate robotics research from university admissions.",
-                        "tab_ids": ids, "categories": ["Robotics", "Admissions"], "mode": mode})
+                        "tab_ids": ids, "categories": ["Robotics", "Admissions"], "mode": mode, "processing": "simple"})
                     assert grouped["grouped"] == 4 and grouped["groups"] == 2 and grouped["verified"]
                     after = await call("list_tabs", {"limit": 100})
                     by_id = {tab["id"]: tab for tab in after["tabs"]}
@@ -99,7 +99,7 @@ async def test_v4_body_semantic_search_and_gemma_groups(local_pages, mode):
                     by_id = {tab["id"]: tab for tab in after["tabs"]}
                     assert all(by_id[tab_id]["groupId"] == -1 for tab_id in ids)
                     automatic = await call("organize_by_text", {
-                        "instruction": "Organize these pages by subject.", "tab_ids": ids})
+                        "instruction": "Organize these pages by subject.", "tab_ids": ids, "processing": "simple"})
                     assert automatic["grouped"] == 4 and automatic["groups"] == 2 and automatic["verified"]
                     await call("undo_last")
                 finally:

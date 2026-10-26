@@ -62,6 +62,15 @@ async def test_native_screenshots_gemma_groups_and_search(visual_pages):
                     return json.loads(result.content[0].text)
 
                 status = await call("browser_status")
+                async def rigorous(instruction, categories=None):
+                    job = await call("catalogue_tabs", {"tab_ids": ids, "instruction": instruction,
+                        "categories": categories, "processing": "rigorous"})
+                    for _ in range(120):
+                        job = await call("catalogue_tabs", {"action": "status", "job_id": job["jobId"], "wait_seconds": 10})
+                        assert job["state"] != "failed", job
+                        if job["state"] == "complete":
+                            return await call("catalogue_tabs", {"action": "apply", "job_id": job["jobId"]})
+                    raise AssertionError("Rigorous catalogue timed out")
                 assert status["stage"] == "v5" and status["visualCapture"]
                 before = await call("list_tabs", {"limit": 100})
                 window = before["tabs"][0]["windowId"]
@@ -73,8 +82,7 @@ async def test_native_screenshots_gemma_groups_and_search(visual_pages):
                     assert plain["indexed"] == 4 and plain["visual"] == 0
                     text_only = await call("search_tabs", {"query": "tree", "limit": 100})
                     assert not {tab["id"] for tab in text_only["tabs"]} & set(ids)
-                    grouped = await call("organize_by_text", {"tab_ids": ids, "instruction": "Separate tree illustrations from data charts.",
-                        "categories": ["Trees", "Data charts"], "visual": True})
+                    grouped = await rigorous("Separate tree illustrations from data charts.", ["Trees", "Data charts"])
                     assert grouped["verified"] and grouped["grouped"] == 4 and grouped["groups"] == 2
                     after = await call("list_tabs", {"window_id": window, "limit": 100})
                     tabs = {tab["id"]: tab for tab in after["tabs"]}
@@ -86,8 +94,7 @@ async def test_native_screenshots_gemma_groups_and_search(visual_pages):
                     private = await call("search_tabs", {"query": "PRIVATE_FORM_SENTINEL", "limit": 100})
                     assert not set(ids) & {tab["id"] for tab in private["tabs"]}
                     await call("undo_last")
-                    automatic = await call("organize_by_text", {"tab_ids": ids,
-                        "instruction": "Organize these pages by their visible subject.", "visual": True, "mode": "sequential"})
+                    automatic = await rigorous("Organize these pages by their visible subject.")
                     with sqlite3.connect(STATE / "browser.sqlite3") as db:
                         evidence = [db.execute("SELECT content FROM pages WHERE tab_id=?", (tab_id,)).fetchone()[0] for tab_id in ids]
                     assert automatic["verified"] and automatic["grouped"] == 4 and automatic["groups"] == 2, evidence

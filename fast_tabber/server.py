@@ -38,6 +38,13 @@ from fast_tabber.preflight import GEMMA, OLLAMA
 STATE = Path(__file__).resolve().parent.parent / ".state"
 
 
+def processing_choice():
+    return {"requiresChoice": True, "question": "Simple text-only grouping or rigorous screenshot-assisted batching?",
+            "choices": {"simple": "Rendered text and cached content; no screenshots",
+                        "rigorous": "Text first, screenshots for unresolved tabs; may activate Chrome"},
+            "started": False}
+
+
 class StateStore:
     def __init__(self, path: Path):
         self.path = path.resolve()
@@ -398,7 +405,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         return decorate
     serialized_processing = serialized(processing_lock)
     serialized_catalogue = serialized(catalogue_control_lock)
-    mcp = MCPServer("fast-tabber", version="0.5.1", instructions="Manage, search, and organize Chrome tabs with local Gemma text, vision, and semantic embeddings.")
+    mcp = MCPServer("fast-tabber", version="0.5.2", instructions="Manage, search, and organize Chrome tabs with local Gemma text, vision, and semantic embeddings.")
 
     async def mutate(operation: str, arguments: dict, collection_name: str | None = None):
         async with operation_lock:
@@ -564,16 +571,22 @@ def create_app(token: str, origin: str, database: Path | None = None):
             raise ToolError(str(error)) from error
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
-    async def organize_tabs(action: str, tab_ids: list[int] | None = None, group_id: int | None = None,
+    async def organize_tabs(action: Literal["create", "add", "remove", "update", "delete", "move"], tab_ids: list[int] | None = None, group_id: int | None = None,
                             title: str | None = None, color: str | None = None, collapsed: bool | None = None,
                             window_id: int | None = None, index: int | None = None, mode: str = "batch") -> dict[str, Any]:
-        """Create, add/remove tabs from, update, or delete native groups; or move tabs. Modes are batch or sequential."""
+        """Edit native groups with explicit tab/group IDs. Not natural-language organization: use catalogue_tabs for that."""
         try:
             if mode not in {"batch", "sequential"}:
                 raise ValueError("mode must be batch or sequential")
             ids = tab_ids or []
             if len(ids) > 500 or len(set(ids)) != len(ids):
                 raise ValueError("tab_ids must be unique and contain at most 500 IDs")
+            if action in {"create", "add", "remove", "move"} and not ids:
+                raise ValueError(f"{action} requires tab_ids; natural-language organization uses catalogue_tabs after asking Simple or Rigorous")
+            if action in {"add", "update", "delete"} and group_id is None:
+                raise ValueError(f"{action} requires group_id")
+            if action == "update" and title is None and color is None and collapsed is None:
+                raise ValueError("update requires title, color, or collapsed")
             if action == "move":
                 if window_id is None:
                     raise ValueError("move requires window_id")
@@ -638,9 +651,12 @@ def create_app(token: str, origin: str, database: Path | None = None):
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
     @serialized_processing
-    async def index_tabs(tab_ids: list[int] | None = None, window_id: int | None = None, visual: bool = False) -> dict[str, Any]:
+    async def index_tabs(tab_ids: list[int] | None = None, window_id: int | None = None, visual: bool = False,
+                         confirm_visual: bool = False) -> dict[str, Any]:
         """Refresh local text/semantic index; visual=True adds native screenshots interpreted by local Gemma. Returns counts only."""
         try:
+            if visual and not confirm_visual:
+                return processing_choice()
             if visual and (not tab_ids or len(tab_ids) > 20):
                 raise ValueError("Use catalogue_tabs for automatic whole-browser visual indexing; it checkpoints each page and limits memory use.")
             if tab_ids is not None and (not tab_ids or len(tab_ids) > 500 or len(set(tab_ids)) != len(tab_ids)):
@@ -691,9 +707,14 @@ def create_app(token: str, origin: str, database: Path | None = None):
     @serialized_processing
     async def organize_by_text(instruction: str, tab_ids: list[int] | None = None,
                                window_id: int | None = None, categories: list[str] | None = None,
-                               mode: str = "batch", visual: bool = False, use_index: bool = False) -> dict[str, Any]:
+                               mode: str = "batch", visual: bool = False, use_index: bool = False,
+                               processing: Literal["simple", "rigorous"] | None = None) -> dict[str, Any]:
         """Group text/semantic content; visual=True adds local Gemma screenshot interpretation before grouping."""
         try:
+            if processing is None:
+                return processing_choice()
+            if visual or processing == "rigorous":
+                raise ValueError("Screenshot organization must use catalogue_tabs(processing='rigorous') after the user's choice; direct capture sweeps are disabled")
             if visual and not use_index and (not tab_ids or len(tab_ids) > 20):
                 raise ValueError("Start catalogue_tabs, wait for completion, then organize with use_index=true and visual=true.")
             if mode not in {"batch", "sequential"}:
@@ -765,6 +786,8 @@ def create_app(token: str, origin: str, database: Path | None = None):
                 return job["state"] == "cancelled"
 
             for phase in ("text", "visual", "close"):
+                if phase == "visual" and job.get("processing") == "simple":
+                    continue
                 if phase == "close" and not job.get("close_after_index"):
                     continue
                 job["phase"] = phase
@@ -787,6 +810,18 @@ def create_app(token: str, origin: str, database: Path | None = None):
                             if name not in job.setdefault("backups", []):
                                 job["backups"].append(name)
                             extracted = await bridge.call("extract_tabs", {"tabIds": list(current)})
+                            sleeping = [item["id"] for item in extracted["failures"] if item["reason"] == "discarded_tab_not_woken"
+                                        and store.index.cached_page(current[item["id"]]) is None]
+                            if sleeping:
+                                extracted["failures"] = [item for item in extracted["failures"] if item["id"] not in sleeping]
+                                for tab_id in sleeping:
+                                    async with operation_lock:
+                                        extra = await bridge.call("extract_tabs", {"tabIds": [tab_id], "wakeSleeping": True})
+                                    extracted["items"].extend(extra["items"])
+                                    extracted["failures"].extend(extra["failures"])
+                                    if store.get_job(job_id)["state"] == "cancel_requested":
+                                        await checkpoint()
+                                        return
                             failures = [item for item in extracted["failures"] if item["reason"] not in {"discarded_tab_not_woken", "no_rendered_text"}]
                             if failures:
                                 raise RuntimeError(f"Text extraction failed: {failures[:3]}")
@@ -798,8 +833,10 @@ def create_app(token: str, origin: str, database: Path | None = None):
                                     known=sorted({item["category"] for item in job["items"] if item.get("category")}))
                             await index_pages(pages)
                             for item in pending:
-                                item.update(decisions[item["id"]], text_done=True,
-                                            done=not decisions[item["id"]]["needs_visual"])
+                                decision = decisions[item["id"]]
+                                if job.get("processing") == "simple" and decision["needs_visual"]:
+                                    decision = {"category": "Uncategorized", "needs_visual": False}
+                                item.update(decision, text_done=True, done=not decision["needs_visual"])
                         elif phase == "visual":
                             for item in pending:
                                 cached = store.index.cached_page(current[item["id"]])
@@ -830,12 +867,15 @@ def create_app(token: str, origin: str, database: Path | None = None):
     async def catalogue_tabs(action: Literal["start", "status", "resume", "cancel", "apply"] = "start", job_id: str = "", tab_ids: list[int] | None = None,
                              wait_seconds: Annotated[int, Field(ge=0, le=30)] = 20,
                              instruction: str = "Organize tabs by subject", categories: list[str] | None = None,
-                             close_after_index: bool = False, confirm_close: bool = False) -> dict[str, Any]:
+                             close_after_index: bool = False, confirm_close: bool = False,
+                             processing: Literal["simple", "rigorous"] | None = None) -> dict[str, Any]:
         """Text-first catalogue; screenshot unresolved pages only. Checkpoints/backups in batches of 50. start/status/resume/cancel/apply. Closing requires user confirmation."""
         try:
             if action not in {"start", "status", "resume", "cancel", "apply"}:
                 raise ValueError("Choose start, status, resume, cancel, or apply")
             if action == "start":
+                if processing is None:
+                    return processing_choice()
                 if not instruction.strip() or len(instruction) > 1000:
                     raise ValueError("instruction must contain 1 to 1000 characters")
                 if categories is not None and (not categories or len(categories) > 20 or len(set(categories)) != len(categories)
@@ -856,7 +896,8 @@ def create_app(token: str, origin: str, database: Path | None = None):
                 async with httpx.AsyncClient(base_url=OLLAMA, timeout=180, trust_env=False) as client:
                     await _gemma_digest(client, STATE)
                 job = {"id": secrets.token_hex(8), "state": "running", "items": items,
-                       "instruction": instruction, "categories": categories, "close_after_index": close_after_index}
+                       "instruction": instruction, "categories": categories, "close_after_index": close_after_index,
+                       "processing": processing}
                 store.save_job(job)
                 catalogue_tasks[job["id"]] = asyncio.create_task(run_catalogue(job["id"]))
             else:
@@ -881,12 +922,15 @@ def create_app(token: str, origin: str, database: Path | None = None):
                         return {"grouped": 0, "verified": True}
                     if len(grouped) > 20:
                         raise ValueError("More than 20 labels were inferred; rerun with explicit categories")
-                    return await mutate("group_categories", {"categories": [{"title": label, "tabIds": ids} for label, ids in grouped.items()],
+                    result = await mutate("group_categories", {"categories": [{"title": label, "tabIds": ids} for label, ids in grouped.items()],
                         "mode": "batch", "expectedUrls": {str(item["id"]): item["url"] for item in job["items"]}})
+                    return {**result, "verified": True}
                 elif action == "cancel":
                     job["state"] = "cancel_requested" if active else "cancelled"
                     store.save_job(job)
                 elif action == "resume":
+                    if job.get("processing") not in {"simple", "rigorous"}:
+                        raise ValueError("This job has no user-selected processing mode; start a new catalogue after asking Simple or Rigorous")
                     if "instruction" not in job:
                         raise ValueError("This job predates text-first cataloguing; start a new catalogue to reuse its local index")
                     if active or any(not task.done() for task in catalogue_tasks.values()):
@@ -995,7 +1039,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         await bridge.connect(socket, token, origin)
 
     async def health(request):
-        return JSONResponse({"name": "fast-tabber", "version": "0.5.1", "root": str(STATE.parent),
+        return JSONResponse({"name": "fast-tabber", "version": "0.5.2", "root": str(STATE.parent),
             "connected": bridge.peer is not None, "extensionVersion": bridge.extension_version, "pid": os.getpid(),
             "busy": operation_lock.locked() or processing_lock.locked() or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values())})
 

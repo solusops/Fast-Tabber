@@ -26,7 +26,9 @@ Detection uses an authenticated extension connection, not a process-name guess. 
 
 ## Scope and local data
 
-Whole-browser cataloguing supports up to 2,000 tabs. The first pass assesses URLs, titles, available rendered text and cached content locally; sleeping tabs stay asleep. Gemma requests screenshots only for insufficient evidence. A second pass captures those unresolved pages one at a time. Originally discarded tabs are returned to sleep and checked; a discard failure stops the job. Native DevTools capture masks fields/forms/frames and detaches. It may briefly activate a tab; this preview does not claim fully headless capture.
+For natural-language organization, OpenCode asks **Simple** or **Rigorous** before processing. Simple uses rendered text and cache with no screenshots; insufficient evidence remains Uncategorized. Rigorous adds screenshots for unresolved pages and warns that Chrome may activate. Unselected requests return a choice instead of starting a job; direct screenshot organization sweeps are disabled.
+
+Cataloguing supports up to 2,000 tabs. Sleeping pages without cached text are loaded individually in the background, read and returned to sleep without changing focus. Text is bounded to 12,000 characters per page and chunked locally. Screenshot capture masks fields/forms/frames, restores Chrome window geometry/state and detaches. Discard/restoration failures stop the job. This preview does not claim fully headless capture.
 
 Recovery collections and progress checkpoints use batches of 50; cached index artifacts remain durable between checkpoints. Interrupted jobs can resume. The agent applies the saved classification after completion, without recapturing. Optional archive-and-close requires explicit confirmation, saves batches before closure and journals verified close operations. Unsaved forms/session state cannot be restored by reopening URLs. Sequential work is paused.
 

@@ -18,8 +18,9 @@ def call(client, arguments):
     return json.loads(result["content"][0]["text"])
 
 
-@pytest.mark.parametrize("fail_capture,close_after", [(False, False), (True, False), (False, True)])
-def test_six_hundred_sleeping_tabs_text_first_and_fifty_tab_backups(tmp_path, monkeypatch, fail_capture, close_after):
+@pytest.mark.parametrize("fail_capture,close_after,processing", [(False, False, "rigorous"), (True, False, "rigorous"),
+    (False, True, "rigorous"), (False, False, "simple")])
+def test_six_hundred_sleeping_tabs_text_first_and_fifty_tab_backups(tmp_path, monkeypatch, fail_capture, close_after, processing):
     tabs = [{"id": i, "url": f"https://example.test/{i}", "title": "Page", "windowId": 1, "discarded": True}
             for i in range(1, 601)]
     calls = []
@@ -30,6 +31,8 @@ def test_six_hundred_sleeping_tabs_text_first_and_fifty_tab_backups(tmp_path, mo
         if operation == "capture_tabs":
             return {"tabs": [tabs[i - 1] for i in arguments["tabIds"]], "groups": {}}
         if operation == "extract_tabs":
+            if arguments.get("wakeSleeping"):
+                return {"items": [{**tabs[i - 1], "text": "Research notes", "headings": []} for i in arguments["tabIds"]], "failures": []}
             return {"items": [], "failures": [{"id": i, "reason": "discarded_tab_not_woken"} for i in arguments["tabIds"]]}
         if operation == "capture_page":
             if fail_capture:
@@ -58,18 +61,19 @@ def test_six_hundred_sleeping_tabs_text_first_and_fifty_tab_backups(tmp_path, mo
     app = server.create_app(TOKEN, "chrome-extension://test", tmp_path / "browser.sqlite3")
     monkeypatch.setattr(app.state.bridge, "call", bridge)
     with TestClient(app, base_url="http://127.0.0.1:8765") as client:
-        job = call(client, {"action": "start", "close_after_index": close_after, "confirm_close": close_after})
+        job = call(client, {"action": "start", "close_after_index": close_after, "confirm_close": close_after, "processing": processing})
         for _ in range(20):
             job = call(client, {"action": "status", "job_id": job["jobId"], "wait_seconds": 1})
             if job["state"] in {"complete", "failed"}:
                 break
     assert job["textAssessed"] == 600
     assert job["backupBatches"] == 12
-    assert job["screenshotsNeeded"] == 6
+    assert job["screenshotsNeeded"] == (0 if processing == "simple" else 6)
     assert job["state"] == ("failed" if fail_capture else "complete")
-    assert sum(operation == "capture_page" for operation, _ in calls) == (1 if fail_capture else 6)
-    first_capture = next(i for i, (operation, _) in enumerate(calls) if operation == "capture_page")
-    assert sum(operation == "extract_tabs" for operation, _ in calls[:first_capture]) == 12
+    assert sum(operation == "capture_page" for operation, _ in calls) == (0 if processing == "simple" else 1 if fail_capture else 6)
+    if processing == "rigorous":
+        first_capture = next(i for i, (operation, _) in enumerate(calls) if operation == "capture_page")
+        assert sum(operation == "extract_tabs" and not args.get("wakeSleeping") for operation, args in calls[:first_capture]) == 12
     assert sum(operation == "close_tabs" for operation, _ in calls) == (12 if close_after else 0)
     assert not any(operation == "group_categories" for operation, _ in calls)
     assert job["closed"] == (600 if close_after else 0)

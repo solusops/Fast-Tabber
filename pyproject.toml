@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fast-tabber"
-version = "0.5.1"
+version = "0.5.2"
 description = "Local, agent-native Chrome tab management"
 requires-python = ">=3.13"
 dependencies = ["mcp==2.3.0", "starlette==1.10.0", "uvicorn==0.54.0", "websockets==17.3", "httpx==0.28.1", "numpy==2.5.4", "scikit-learn==1.9.1", "pywin32==312; sys_platform == 'win32'"]

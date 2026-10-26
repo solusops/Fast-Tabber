@@ -14,11 +14,11 @@ Requires the installed MCP server, paired Chrome extension, and configured local
 
 ## Organize a collection
 
-1. Start `catalogue_tabs` with the user's instruction and optional category labels; omit IDs for the whole browser. The local job assesses URLs, text and cached content first. Only unresolved pages need screenshots. Checkpoints and recovery collections use batches of 50.
+1. Ask the user to choose **Simple** (rendered text and cache, no screenshots) or **Rigorous** (text first, screenshots for unresolved tabs; may activate Chrome), unless they already chose. Wait for the answer. Start `catalogue_tabs(processing="simple"|"rigorous")` with the user's exact instruction and optional categories; omit IDs for the whole browser. Preserve requests such as “as few coherent groups as possible”; do not invent categories from URLs. Sleeping pages without cached text are loaded one at a time in the background for text extraction. Checkpoints and recovery collections use batches of 50.
 2. Poll `action="status", wait_seconds=30` with the job ID. Report progress while running. Use `resume` after interruption; stop on failure. Avoid per-tab agent calls.
 3. After completion, call `action="apply"` to apply saved classifications in native batch mode, then report the verified result. Sequential demonstrations are paused.
 
-`index_tabs` refreshes text/semantic search; `visual=true` is available for a small explicit selection. Screenshots may activate pages. Originally sleeping tabs are re-discarded and checked; restoration can fail. Bulk content, images, embeddings and full URLs stay in the local index.
+`organize_tabs` edits known native group IDs; it does not interpret natural-language instructions. Use the catalogue workflow for that. Do not call `organize_by_text(visual=true)`: direct capture sweeps are disabled. For an explicitly requested screenshot index of a small selection, `index_tabs(visual=true, confirm_visual=true)` requires prior user authorization. Screenshots may activate pages. Originally sleeping tabs are re-discarded and checked; restoration can fail. Bulk content, images, embeddings and full URLs stay local. Simple leaves insufficiently evidenced pages Uncategorized; it must never escalate to screenshots automatically.
 
 ## Closing, recovery, and deletion
 

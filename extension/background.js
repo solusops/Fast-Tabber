@@ -348,11 +348,33 @@ async function findDuplicates({ windowId, remove = false, mode = "batch" }) {
   return { removed: result.closed, verified: result.verified, before: result.before };
 }
 
-async function extractTabs({ tabIds, windowId }) {
+async function extractTabs({ tabIds, windowId, wakeSleeping = false }) {
   const tabs = tabIds ? await Promise.all(tabIds.map(id => chrome.tabs.get(id))) :
     await chrome.tabs.query({ windowType: "normal", ...(windowId == null ? {} : { windowId }) });
   const normal = tabs.filter(tab => !tab.incognito);
   if (normal.length > 500) throw new Error("Text extraction is limited to 500 tabs per request");
+  if (wakeSleeping) {
+    const combined = { items: [], failures: [] };
+    for (const tab of normal) {
+      if (!/^https?:\/\//i.test(tab.url || "") || new URL(tab.url).username || new URL(tab.url).password)
+        throw new Error("Only ordinary web tabs without embedded credentials can be extracted");
+      try {
+        if (tab.discarded) {
+          await chrome.tabs.reload(tab.id);
+          await waitForLoad(tab.id);
+        }
+        const result = await extractTabs({ tabIds: [tab.id] });
+        combined.items.push(...result.items);
+        combined.failures.push(...result.failures);
+      } finally {
+        if (tab.discarded && !(await chrome.tabs.get(tab.id)).discarded) {
+          await chrome.tabs.discard(tab.id);
+          if (!(await chrome.tabs.get(tab.id)).discarded) throw new Error("Text extraction could not restore sleeping state");
+        }
+      }
+    }
+    return combined;
+  }
   const items = [];
   const failures = [];
   const extract = () => {
@@ -371,7 +393,7 @@ async function extractTabs({ tabIds, windowId }) {
       chunks.push(walker.currentNode.nodeValue);
       previousBlock = block;
     }
-    const text = chunks.join("").replace(/\s+/g, " ").trim().slice(0, 2200);
+    const text = chunks.join("").replace(/\s+/g, " ").trim().slice(0, 12000);
     return { title: document.title.slice(0, 200), headings, text };
   };
   for (let offset = 0; offset < normal.length; offset += 8) {
@@ -504,7 +526,11 @@ async function capturePage({ tabId }) {
         await chrome.tabs.update(previous.id, { active: true });
         if (!(await chrome.tabs.get(previous.id)).active) throw new Error("Previous active tab was not restored");
       }
-      if (captureWindow.state === "minimized") await chrome.windows.update(tab.windowId, { state: "minimized" });
+      if (captureWindow.state === "normal" || captureWindow.state === "minimized") {
+        await chrome.windows.update(tab.windowId, { left: captureWindow.left, top: captureWindow.top,
+          width: captureWindow.width, height: captureWindow.height });
+      }
+      await chrome.windows.update(tab.windowId, { state: captureWindow.state });
       if (tab.discarded) {
         await chrome.tabs.discard(tabId);
         if (!(await chrome.tabs.get(tabId)).discarded) throw new Error("Originally sleeping tab was not returned to sleep");
