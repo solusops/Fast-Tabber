@@ -6,9 +6,18 @@ import httpx
 import json
 
 from fast_tabber.text import _response_content, classify_pages, validate_assignments, validate_cluster_labels, structured_batches
+from fast_tabber.text import validate_triage
 
 
 PAGES = [{"id": 1}, {"id": 2}]
+
+
+def test_triage_requires_explicit_sufficiency_and_valid_category():
+    payload = {"assignments": [{"id": 1, "category": "Research", "needs_visual": False}]}
+    assert validate_triage(payload, [{"id": 1, "visual": True}], ["Research"])[1]["needs_visual"] is False
+    payload["assignments"][0]["needs_visual"] = "false"
+    with pytest.raises(RuntimeError, match="sufficiency"):
+        validate_triage(payload, [{"id": 1}])
 
 
 def test_valid_classification_covers_each_page_once():

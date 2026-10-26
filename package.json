@@ -1,6 +1,6 @@
 {
   "name": "fast-tabber-toolkit",
-  "version": "0.5.0",
+  "version": "0.5.1-preview.2",
   "private": true,
   "type": "module",
   "main": "./opencode-plugin.js",

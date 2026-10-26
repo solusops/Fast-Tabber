@@ -28,15 +28,13 @@ function Get-TabberHealth {
 }
 
 Get-Command uv -ErrorAction Stop | Out-Null
-Get-Command ollama -ErrorAction Stop | Out-Null
+$TabberOllamaCommand = Get-Command ollama -ErrorAction SilentlyContinue
+$TabberOllama = if ($TabberOllamaCommand) { $TabberOllamaCommand.Source } else { Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Ollama\ollama.exe' }
+if (!(Test-Path -LiteralPath $TabberOllama)) { throw 'Install Ollama, then restart OpenCode or add ollama.exe to PATH.' }
 $TabberHealth = Get-TabberHealth
 if (!$StartOnly) {
     if ($TabberHealth) {
         if ($TabberHealth.busy) { throw 'Fast-Tabber is busy; finish the current browser operation, then run installation again.' }
-        $TabberConnection = Get-Content -LiteralPath (Join-Path $TabberRoot '.state\connection.json') -Raw | ConvertFrom-Json
-        Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8765/shutdown' -Headers @{Authorization="Bearer $($TabberConnection.token)"} -TimeoutSec 5 | Out-Null
-        for ($TabberWait=0; $TabberWait -lt 20 -and (Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue); $TabberWait++) { Start-Sleep -Milliseconds 500 }
-        if (Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue) { throw 'The previous service did not stop cleanly.' }
     }
     New-Item -ItemType Directory -Path $TabberRoot -Force | Out-Null
     if ([IO.Path]::GetFullPath($TabberSource) -ne $TabberRoot) {
@@ -44,7 +42,7 @@ if (!$StartOnly) {
             New-Item -ItemType Directory -Path (Join-Path $TabberRoot $TabberDirectory) -Force | Out-Null
         }
         Get-ChildItem -LiteralPath (Join-Path $TabberSource 'fast_tabber') -Filter '*.py' | Copy-Item -Destination (Join-Path $TabberRoot 'fast_tabber') -Force
-        foreach ($TabberFile in @('extension\manifest.json','extension\background.js','.agents\skills\fast-tabber\SKILL.md','requirements.lock.txt','pyproject.toml','package.json','tabber.ps1','opencode-plugin.js','install.ps1','README.md','LICENSE')) {
+        foreach ($TabberFile in @('extension\manifest.json','extension\background.js','.agents\skills\fast-tabber\SKILL.md','requirements.lock.txt','pyproject.toml','package.json','tabber.ps1','opencode-plugin.js','install.ps1','install.cmd','README.md','LICENSE')) {
             Copy-Item -LiteralPath (Join-Path $TabberSource $TabberFile) -Destination (Join-Path $TabberRoot $TabberFile) -Force
         }
     }
@@ -58,8 +56,9 @@ if (!$StartOnly) {
 }
 $env:OLLAMA_HOST = '127.0.0.1:11434'
 $env:OLLAMA_NO_CLOUD = '1'
+$env:OLLAMA_CONTEXT_LENGTH = '32768'
 try { $TabberModels = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3 } catch {
-    Start-Process -FilePath (Get-Command ollama).Source -ArgumentList 'serve' -WorkingDirectory $TabberRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $TabberRoot '.state\ollama.stdout.log') -RedirectStandardError (Join-Path $TabberRoot '.state\ollama.stderr.log') | Out-Null
+    Start-Process -FilePath $TabberOllama -ArgumentList 'serve' -WorkingDirectory $TabberRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $TabberRoot '.state\ollama.stdout.log') -RedirectStandardError (Join-Path $TabberRoot '.state\ollama.stderr.log') | Out-Null
     for ($TabberWait=0; $TabberWait -lt 30; $TabberWait++) {
         Start-Sleep -Seconds 1
         try { $TabberModels = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 2; break } catch {}
@@ -70,10 +69,20 @@ if (Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyCon
 foreach ($TabberModel in @('gemma4:e2b','embeddinggemma-2:740m')) {
     if ($TabberModel -notin $TabberModels.models.name) {
         if ($StartOnly) { throw "Required model missing: $TabberModel. Run installation again; no substitute is permitted." }
-        Invoke-TabberCommand 'ollama' @('pull',$TabberModel)
+        Invoke-TabberCommand $TabberOllama @('pull',$TabberModel)
     }
 }
-if (!$StartOnly) { Invoke-TabberCommand $TabberPython @('-m','fast_tabber.preflight') }
+if (!$StartOnly) {
+    Invoke-TabberCommand $TabberPython @('-m','fast_tabber.preflight')
+    $TabberHealth = Get-TabberHealth
+    if ($TabberHealth) {
+        if ($TabberHealth.busy) { throw 'Fast-Tabber became busy; finish its operation and retry installation.' }
+        $TabberConnection = Get-Content -LiteralPath (Join-Path $TabberRoot '.state\connection.json') -Raw | ConvertFrom-Json
+        Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8765/shutdown' -Headers @{Authorization="Bearer $($TabberConnection.token)"} -TimeoutSec 5 | Out-Null
+        for ($TabberWait=0; $TabberWait -lt 20 -and (Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue); $TabberWait++) { Start-Sleep -Milliseconds 500 }
+        if (Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue) { throw 'The previous service did not stop cleanly.' }
+    }
+}
 $TabberHealth = Get-TabberHealth
 if (!$TabberHealth) {
     Start-Process -FilePath $TabberPython -ArgumentList '-m','fast_tabber.server' -WorkingDirectory $TabberRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $TabberRoot '.state\server.stdout.log') -RedirectStandardError (Join-Path $TabberRoot '.state\server.stderr.log') | Out-Null
@@ -92,6 +101,7 @@ if (!$StartOnly) {
     $TabberModule = ([Uri](Join-Path $TabberRoot 'opencode-plugin.js')).AbsoluteUri | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($TabberEntry, "// Fast-Tabber managed entry`nexport { FastTabberPlugin } from $TabberModule;`n", (New-Object Text.UTF8Encoding($false)))
     Write-Output "Installed MCP server + Skill. Restart OpenCode in: $Workspace"
+    Write-Output 'Use /tabs list my tabs, or select Tabber. Selecting the Skill alone does not install MCP or switch agents.'
     Write-Output "Existing Chrome pairing reused when available. First installation only: load $TabberRoot\extension in Chrome and approve its permissions."
 }
 $TabberExpectedVersion = (Get-Content -LiteralPath (Join-Path $TabberRoot 'extension\manifest.json') -Raw | ConvertFrom-Json).version

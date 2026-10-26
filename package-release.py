@@ -5,12 +5,12 @@ from zipfile import ZipFile, ZIP_DEFLATED
 
 root = Path(__file__).resolve().parent
 files = [root / name for name in (
-    "install.ps1", "opencode-plugin.js", "package.json", "pyproject.toml",
+    "install.ps1", "install.cmd", "opencode-plugin.js", "package.json", "pyproject.toml",
     "requirements.lock.txt", "tabber.ps1", "README.md", "LICENSE",
     "extension/manifest.json", "extension/background.js",
     ".agents/skills/fast-tabber/SKILL.md",
 )] + sorted((root / "fast_tabber").glob("*.py"))
-target = root / "dist" / "fast-tabber-0.5.0-preview.1.zip"
+target = root / "dist" / "fast-tabber-0.5.1-preview.2.zip"
 target.parent.mkdir(exist_ok=True)
 with ZipFile(target, "w", ZIP_DEFLATED) as archive:
     for path in files:

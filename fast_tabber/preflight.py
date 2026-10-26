@@ -74,7 +74,7 @@ async def check_models(client):
             raise RuntimeError("The exact Gemma runtime must support thinking")
         capabilities[name] = info["capabilities"]
 
-    common = {"model": GEMMA, "stream": False, "think": True, "options": {"num_ctx": 16384, "num_predict": 4096}}
+    common = {"model": GEMMA, "stream": False, "think": True, "options": {"temperature": 0, "num_ctx": 16384, "num_predict": 8192}}
     reply = await request(client, "/api/chat", common | {
         "messages": [{"role": "user", "content": "Reply with exactly READY."}],
     })
@@ -95,11 +95,11 @@ async def check_models(client):
     print("PASS structured tool selection (agent round-trip still requires Chrome)", flush=True)
 
     vision = await request(client, "/api/chat", common | {
-        "format": {"type": "object", "properties": {"color": {"type": "string"}}, "required": ["color"]},
+        "format": {"type": "object", "properties": {"color": {"type": "string", "enum": ["red", "green", "blue", "white", "black", "yellow"]}}, "required": ["color"]},
         "messages": [{"role": "user", "images": [red_image()], "content": "Identify the dominant color of this image. Return JSON with color."}],
     })
     if json.loads(vision["message"]["content"])["color"].lower().strip() != "red":
-        raise RuntimeError("Gemma image inference failed the visual fixture")
+        raise RuntimeError(f"Gemma image inference failed the visual fixture: {vision['message']['content'][:100]}")
     print("PASS local image interpretation", flush=True)
 
     result = await request(client, "/api/embed", {"model": EMBEDDING, "input": ["robot learning", "university admissions"], "truncate": False})
@@ -117,8 +117,29 @@ async def check_models(client):
     if similarity(image_vectors[0], image_vectors[1]) <= similarity(image_vectors[0], image_vectors[2]):
         raise RuntimeError("EmbeddingGemma did not distinguish the red image from blue text")
     print("PASS direct image embeddings in the shared text/image space", flush=True)
+    # OpenCode uses this transport; native /api/chat success alone does not validate it.
+    conversation = [{"role": "user", "content": "Call check_local_runtime now. After its result, report the returned status."}]
+    tool_spec = [{"type": "function", "function": {"name": "check_local_runtime", "description": "Get local runtime status",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}}]
+    agent_request = {"model": GEMMA, "messages": conversation, "tools": tool_spec, "stream": False,
+                     "temperature": 0, "max_tokens": 8192}
+    selection = await request(client, "/v1/chat/completions", agent_request)
+    message = selection["choices"][0]["message"]
+    calls = message.get("tool_calls", [])
+    if len(calls) != 1 or calls[0]["function"]["name"] != "check_local_runtime":
+        raise RuntimeError("OpenCode-compatible tool selection failed; no alternate model was selected")
+    conversation.extend([message, {"role": "tool", "tool_call_id": calls[0]["id"], "content": '{"status":"VERIFIED_LOCAL"}'}])
+    result = await request(client, "/v1/chat/completions", agent_request)
+    answer = result["choices"][0]["message"]
+    if answer.get("tool_calls") or "VERIFIED_LOCAL" not in (answer.get("content") or ""):
+        raise RuntimeError("OpenCode-compatible tool-result round trip failed; check Ollama context size and tool support")
+    loaded = (await request(client, "/api/ps"))["models"]
+    if not any(model.get("digest") == digests[GEMMA] and model.get("context_length", 0) >= 32768 for model in loaded):
+        raise RuntimeError("OpenCode needs OLLAMA_CONTEXT_LENGTH=32768 on the running Ollama service; restart Ollama with that setting")
+    print("PASS OpenCode-compatible tool-result round trip and 32K runtime context", flush=True)
     return {"models": digests, "capabilities": capabilities, "embedding_dimensions": len(vectors[0]),
-            "multimodal_embeddings": True, "external_inference_block_test": "not yet performed"}
+            "multimodal_embeddings": True, "openai_tool_round_trip": True, "agent_context": 32768,
+            "external_inference_block_test": "not yet performed"}
 
 
 def save_report(report: dict, state: Path):

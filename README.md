@@ -6,15 +6,17 @@ Chrome tab management inside OpenCode or Codex: an authenticated local MCP serve
 
 Prerequisites: Chrome 120+, OpenCode, [uv](https://docs.astral.sh/uv/getting-started/installation/), and [Ollama](https://ollama.com/download).
 
+Ollama must bind to loopback with `OLLAMA_CONTEXT_LENGTH=32768`; restart an existing Ollama service after changing these settings. The installer uses them when it starts Ollama and verifies the actual OpenCode-compatible tool/result round trip. No model substitution is used.
+
 Give the release ZIP to OpenCode's **Build** agent and ask it to extract it, read this README, and run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File <extracted-folder>\install.ps1 -Workspace <your-project-folder>
+<extracted-folder>\install.cmd -Workspace <your-project-folder>
 ```
 
 The installer creates the Python environment, installs pinned dependencies, downloads `gemma4:e2b` and `embeddinggemma-2:740m` if missing, verifies text/tool/vision/image-embedding execution, and starts the loopback MCP service. It adds a project plugin without replacing existing agent configurations. A shared runtime registry at `~/.fast-tabber/runtime.json` lets other OpenCode installations reuse the same service, data, and Chrome pairing.
 
-Restart OpenCode in that project and select **Tabber**, or run `opencode --agent tabber`. Prompt there normally: “Organize my browser”, “Find tabs about robotics”, “Save these tabs”, or “Revert last change”. The Tabber agent allows MCP tools and questions; shell, file editing, and other tools are denied. Use Build for installation or upgrades.
+Require a successful installer exit, then restart OpenCode in that project and use `/tabs list my tabs`, select **Tabber**, or run `opencode --agent tabber`. Selecting the Skill alone does not install MCP or switch agents. Prompt normally: “Organize my browser”, “Find tabs about robotics”, “Save these tabs”, or “Revert last change”. The Tabber agent allows MCP tools and questions; shell, file editing, and other tools are denied. Use Build for installation or upgrades.
 
 ## Chrome setup
 
@@ -24,7 +26,9 @@ Detection uses an authenticated extension connection, not a process-name guess. 
 
 ## Scope and local data
 
-Whole-browser screenshot cataloguing runs as a persistent background job. It automatically includes sleeping tabs, processes one page at a time, restores originally discarded tabs to sleep, and checkpoints completed pages. The agent checks job progress and then groups from the saved index without recapturing. Interrupted jobs can resume. Native DevTools capture masks fields/forms/frames and detaches after capture. It may briefly activate a tab; this preview does not claim fully headless capture. Sequential work is paused.
+Whole-browser cataloguing supports up to 2,000 tabs. The first pass assesses URLs, titles, available rendered text and cached content locally; sleeping tabs stay asleep. Gemma requests screenshots only for insufficient evidence. A second pass captures those unresolved pages one at a time. Originally discarded tabs are returned to sleep and checked; a discard failure stops the job. Native DevTools capture masks fields/forms/frames and detaches. It may briefly activate a tab; this preview does not claim fully headless capture.
+
+Recovery collections and progress checkpoints use batches of 50; cached index artifacts remain durable between checkpoints. Interrupted jobs can resume. The agent applies the saved classification after completion, without recapturing. Optional archive-and-close requires explicit confirmation, saves batches before closure and journals verified close operations. Unsaved forms/session state cannot be restored by reopening URLs. Sequential work is paused.
 
 `.state/browser.sqlite3` stores local URL mappings, chunks, masked images, Gemma descriptions, and direct text/image embeddings. Thinking remains enabled; the server processes small validated batches. Models and browser data are excluded from the ZIP and Git.
 
@@ -40,3 +44,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <runtime>\tabber.ps1 codex
 ```
 
 Fresh package installation and broader acceptance testing are left to the user for this preview. Benchmarking is deferred.
+
+Interface references: [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools), [Agent Skills](https://agentskills.io/specification), [OpenCode plugins](https://opencode.ai/docs/plugins/). The portable Skill supplies workflow instructions; MCP exposes executable tools. The OpenCode adapter registers both without embedding the entire Skill in every system prompt.

@@ -9,3 +9,6 @@ node_modules/
 extension/pairing.json
 dist/
 build/
+.opencode/
+fast-tabber-*.zip
+fast-tabber-*/

@@ -11,9 +11,11 @@ import secrets
 import sqlite3
 import struct
 import threading
+import time
+from collections import deque
 import httpx
 from functools import wraps
-from typing import Annotated
+from typing import Annotated, Any, Literal
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -27,6 +29,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from fast_tabber.text import classify_pages
 from fast_tabber.text import label_clusters
 from fast_tabber.text import _gemma_digest
+from fast_tabber.text import triage_pages
 from fast_tabber.semantic import cluster_vectors, cosine, embed_texts, embedding_digest
 from fast_tabber.vision import describe_image
 from fast_tabber.index import ContentIndex
@@ -293,8 +296,9 @@ class Bridge:
             timeout = max(timeout, 180)
         async with self.lock:
             if self.peer is None:
-                raise RuntimeError(f"Chrome extension is disconnected. Ask the user to open chrome://extensions, enable Developer mode, "
-                                   f"load unpacked {STATE.parent / 'extension'}, and approve its permissions. Chrome requires this user step.")
+                raise RuntimeError("Chrome extension is disconnected. Open the paired Chrome profile if it is closed; "
+                                   "allow up to 30 seconds for reconnection after a service restart. If already enabled, reload Fast-Tabber in chrome://extensions. "
+                                   f"First installation only: load unpacked {STATE.parent / 'extension'} and approve Chrome permissions.")
             request_id = secrets.token_hex(12)
             future = asyncio.get_running_loop().create_future()
             self.pending[request_id] = future
@@ -349,6 +353,7 @@ class LocalAuthentication:
     def __init__(self, app, token):
         self.app = app
         self.token = token
+        self.requests = deque()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
@@ -362,6 +367,15 @@ class LocalAuthentication:
             if origin and origin not in {b"http://127.0.0.1:8765", b"http://localhost:8765"}:
                 await JSONResponse({"error": "Untrusted origin"}, status_code=403)(scope, receive, send)
                 return
+            if scope["path"] == "/mcp" and scope["method"] == "POST":
+                now = time.monotonic()
+                while self.requests and now - self.requests[0] >= 60:
+                    self.requests.popleft()
+                if len(self.requests) >= 120:
+                    await JSONResponse({"error": "MCP request rate exceeded; wait before retrying"}, status_code=429,
+                                       headers={"Retry-After": "60"})(scope, receive, send)
+                    return
+                self.requests.append(now)
         await self.app(scope, receive, send)
 
 
@@ -384,7 +398,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         return decorate
     serialized_processing = serialized(processing_lock)
     serialized_catalogue = serialized(catalogue_control_lock)
-    mcp = MCPServer("fast-tabber", version="0.5.0", instructions="Manage, search, and organize Chrome tabs with local Gemma text, vision, and semantic embeddings.")
+    mcp = MCPServer("fast-tabber", version="0.5.1", instructions="Manage, search, and organize Chrome tabs with local Gemma text, vision, and semantic embeddings.")
 
     async def mutate(operation: str, arguments: dict, collection_name: str | None = None):
         async with operation_lock:
@@ -492,16 +506,16 @@ def create_app(token: str, origin: str, database: Path | None = None):
             pages.append(page)
         return {"items": pages, "failures": []}
 
-    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
-    async def browser_status() -> dict:
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+    async def browser_status() -> dict[str, Any]:
         """Verify the real Chrome connection and permissions without returning page content."""
         try:
             return await bridge.call("probe")
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=True, open_world_hint=False))
-    async def browser_setup(action: str = "reload_extension") -> dict:
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+    async def browser_setup(action: str = "reload_extension") -> dict[str, Any]:
         """Reload the already paired Chrome extension after a local toolkit update; requires no Computer Use."""
         if action != "reload_extension":
             raise ToolError("action must be reload_extension")
@@ -518,9 +532,9 @@ def create_app(token: str, origin: str, database: Path | None = None):
                     pass
             raise ToolError("Extension reload did not reconnect with the installed version; inspect Chrome permissions")
 
-    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
     async def list_tabs(window_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0,
-                        limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict:
+                        limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict[str, Any]:
         """List compact tab metadata. Returns at most 100 tabs; use offset to page."""
         if offset < 0 or not 1 <= limit <= 100:
             raise ToolError("offset must be nonnegative and limit must be between 1 and 100")
@@ -529,9 +543,9 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
-    async def tab_action(action: str, tab_id: int | None = None, url: str | None = None,
-                         window_id: int | None = None, index: int | None = None) -> dict:
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
+    async def tab_action(action: Literal["open", "close", "activate", "move"], tab_id: int | None = None, url: str | None = None,
+                         window_id: int | None = None, index: int | None = None) -> dict[str, Any]:
         """Open, close, activate, or move one tab. Actions: open(url), close/activate(tab_id), move(tab_id, window_id, index)."""
         try:
             if action not in {"open", "close", "activate", "move"}:
@@ -549,10 +563,10 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
     async def organize_tabs(action: str, tab_ids: list[int] | None = None, group_id: int | None = None,
                             title: str | None = None, color: str | None = None, collapsed: bool | None = None,
-                            window_id: int | None = None, index: int | None = None, mode: str = "batch") -> dict:
+                            window_id: int | None = None, index: int | None = None, mode: str = "batch") -> dict[str, Any]:
         """Create, add/remove tabs from, update, or delete native groups; or move tabs. Modes are batch or sequential."""
         try:
             if mode not in {"batch", "sequential"}:
@@ -572,9 +586,9 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
-    async def collection_action(action: str, name: str = "", tab_ids: list[int] | None = None,
-                                mode: str = "batch") -> dict:
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
+    async def collection_action(action: Literal["save", "list", "close", "restore", "delete"], name: str = "", tab_ids: list[int] | None = None,
+                                mode: str = "batch") -> dict[str, Any]:
         """Save, list, close, restore, or delete a named tab collection."""
         try:
             if action == "list":
@@ -611,8 +625,8 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except (RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
-    async def remove_duplicates(window_id: int | None = None, remove: bool = False, mode: str = "batch") -> dict:
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
+    async def remove_duplicates(window_id: int | None = None, remove: bool = False, mode: str = "batch") -> dict[str, Any]:
         """Find exact-URL duplicate tabs, or close duplicates after explicit confirmation."""
         try:
             if mode not in {"batch", "sequential"}:
@@ -622,9 +636,9 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
     @serialized_processing
-    async def index_tabs(tab_ids: list[int] | None = None, window_id: int | None = None, visual: bool = False) -> dict:
+    async def index_tabs(tab_ids: list[int] | None = None, window_id: int | None = None, visual: bool = False) -> dict[str, Any]:
         """Refresh local text/semantic index; visual=True adds native screenshots interpreted by local Gemma. Returns counts only."""
         try:
             if visual and (not tab_ids or len(tab_ids) > 20):
@@ -644,10 +658,10 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except (RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
     @serialized_processing
-    async def search_tabs(query: str, mode: str = "keyword", offset: Annotated[int, Field(ge=0)] = 0,
-                          limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict:
+    async def search_tabs(query: str, mode: Literal["keyword", "semantic"] = "keyword", offset: Annotated[int, Field(ge=0)] = 0,
+                          limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict[str, Any]:
         """Search local page text by keywords or EmbeddingGemma semantic similarity."""
         try:
             if len(query) > 500 or offset < 0 or not 1 <= limit <= 100 or mode not in {"keyword", "semantic"}:
@@ -673,11 +687,11 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except (RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
     @serialized_processing
     async def organize_by_text(instruction: str, tab_ids: list[int] | None = None,
                                window_id: int | None = None, categories: list[str] | None = None,
-                               mode: str = "batch", visual: bool = False, use_index: bool = False) -> dict:
+                               mode: str = "batch", visual: bool = False, use_index: bool = False) -> dict[str, Any]:
         """Group text/semantic content; visual=True adds local Gemma screenshot interpretation before grouping."""
         try:
             if visual and not use_index and (not tab_ids or len(tab_ids) > 20):
@@ -743,55 +757,106 @@ def create_app(token: str, origin: str, database: Path | None = None):
     async def run_catalogue(job_id):
         try:
             job = store.get_job(job_id)
-            for position, item in enumerate(job["items"]):
-                job = store.get_job(job_id)
-                if job["state"] == "cancel_requested":
+            async def checkpoint():
+                # Persist checkpoints in batches; artifact caching remains durable independently.
+                if store.get_job(job_id)["state"] == "cancel_requested":
                     job["state"] = "cancelled"
-                    store.save_job(job)
-                    return
-                if item.get("done"):
-                    continue
-                current = (await bridge.call("capture_tabs", {"tabIds": [item["id"]]}))["tabs"][0]
-                if current["url"] != item["url"]:
-                    raise RuntimeError("A pending tab navigated; resume or start a new catalogue before continuing")
-                result = await index_tabs(tab_ids=[item["id"]], visual=True)
-                if result["skipped"]:
-                    raise RuntimeError(f"Tab {item['id']} could not be indexed: {result['failures']}")
-                job = store.get_job(job_id)
-                job["items"][position]["done"] = True
                 store.save_job(job)
-                await asyncio.sleep(0)
-            job = store.get_job(job_id)
+                return job["state"] == "cancelled"
+
+            for phase in ("text", "visual", "close"):
+                if phase == "close" and not job.get("close_after_index"):
+                    continue
+                job["phase"] = phase
+                for offset in range(0, len(job["items"]), 50):
+                    if await checkpoint():
+                        return
+                    batch = job["items"][offset:offset + 50]
+                    pending = [item for item in batch if not item.get({"text": "text_done", "visual": "done", "close": "closed"}[phase])]
+                    if not pending:
+                        continue
+                    async with processing_lock:
+                        metadata = await bridge.call("capture_tabs", {"tabIds": [item["id"] for item in pending]})
+                        current = {tab["id"]: tab for tab in metadata["tabs"]}
+                        if any(current[item["id"]]["url"] != item["url"] for item in pending):
+                            raise RuntimeError("A pending tab navigated; start a new catalogue before continuing")
+                        if phase == "text":
+                            name = f"catalogue-{job_id}-{offset // 50 + 1}"
+                            if store.get_collection(name) is None:
+                                store.save_collection(name, metadata)
+                            if name not in job.setdefault("backups", []):
+                                job["backups"].append(name)
+                            extracted = await bridge.call("extract_tabs", {"tabIds": list(current)})
+                            failures = [item for item in extracted["failures"] if item["reason"] not in {"discarded_tab_not_woken", "no_rendered_text"}]
+                            if failures:
+                                raise RuntimeError(f"Text extraction failed: {failures[:3]}")
+                            readable = {page["id"]: page for page in extracted["items"]}
+                            pages = [readable.get(tab["id"]) or store.index.cached_page(tab) or
+                                     {**tab, "headings": [], "text": ""} for tab in current.values()]
+                            async with inference_lock:
+                                decisions = await triage_pages(pages, job["instruction"], job.get("categories"), STATE,
+                                    known=sorted({item["category"] for item in job["items"] if item.get("category")}))
+                            await index_pages(pages)
+                            for item in pending:
+                                item.update(decisions[item["id"]], text_done=True,
+                                            done=not decisions[item["id"]]["needs_visual"])
+                        elif phase == "visual":
+                            for item in pending:
+                                cached = store.index.cached_page(current[item["id"]])
+                                evidence = {"items": [cached], "failures": []} if cached and cached["visual"] else await add_visual_evidence(
+                                    {"items": [], "failures": [{"id": item["id"], "reason": "no_rendered_text"}]})
+                                await index_pages(evidence["items"])
+                                async with inference_lock:
+                                    labels = await classify_pages(evidence["items"], job["instruction"], job.get("categories"), STATE)
+                                item.update(category=labels[item["id"]], done=True)
+                                if store.get_job(job_id)["state"] == "cancel_requested":
+                                    break
+                        else:
+                            # Journal and saved batch precede irreversible tab closure.
+                            await mutate("close_tabs", {"tabIds": list(current), "mode": "batch"})
+                            for item in pending:
+                                item["closed"] = True
+                    if await checkpoint():
+                        return
+                    await asyncio.sleep(0)
             job["state"] = "complete"
             store.save_job(job)
         except Exception as error:
-            job = store.get_job(job_id)
             job.update(state="failed", error=str(error)[:500])
             store.save_job(job)
 
-    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, open_world_hint=False))
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
     @serialized_catalogue
-    async def catalogue_tabs(action: str = "start", job_id: str = "", tab_ids: list[int] | None = None,
-                             wait_seconds: Annotated[int, Field(ge=0, le=30)] = 20) -> dict:
-        """Automatically catalogue all tabs, including sleeping tabs, one page at a time. Checkpointed start/status/resume/cancel jobs."""
+    async def catalogue_tabs(action: Literal["start", "status", "resume", "cancel", "apply"] = "start", job_id: str = "", tab_ids: list[int] | None = None,
+                             wait_seconds: Annotated[int, Field(ge=0, le=30)] = 20,
+                             instruction: str = "Organize tabs by subject", categories: list[str] | None = None,
+                             close_after_index: bool = False, confirm_close: bool = False) -> dict[str, Any]:
+        """Text-first catalogue; screenshot unresolved pages only. Checkpoints/backups in batches of 50. start/status/resume/cancel/apply. Closing requires user confirmation."""
         try:
-            if action not in {"start", "status", "resume", "cancel"}:
-                raise ValueError("Choose start, status, resume, or cancel")
+            if action not in {"start", "status", "resume", "cancel", "apply"}:
+                raise ValueError("Choose start, status, resume, cancel, or apply")
             if action == "start":
+                if not instruction.strip() or len(instruction) > 1000:
+                    raise ValueError("instruction must contain 1 to 1000 characters")
+                if categories is not None and (not categories or len(categories) > 20 or len(set(categories)) != len(categories)
+                        or any(not label.strip() or len(label) > 80 or label == "Uncategorized" for label in categories)):
+                    raise ValueError("Choose 1 to 20 unique category labels, excluding Uncategorized")
+                if close_after_index and not confirm_close:
+                    raise ValueError("Ask the user to confirm archive-and-close, then set confirm_close=true; unsaved page state cannot be restored")
                 if any(not task.done() for task in catalogue_tasks.values()):
                     raise ValueError("A catalogue is already running; inspect or cancel its job before starting another")
                 metadata = await bridge.call("capture_tabs", {"tabIds": tab_ids}) if tab_ids else await bridge.call("capture_browser")
                 items = []
                 for tab in metadata["tabs"]:
                     if tab["url"].startswith(("http://", "https://")):
-                        cached = store.index.cached_page(tab)
-                        items.append({"id": tab["id"], "url": tab["url"], "done": bool(cached and cached["visual"])})
-                if not items or len(items) > 500:
-                    raise ValueError("Catalogue requires 1 to 500 ordinary web tabs")
+                        items.append({"id": tab["id"], "url": tab["url"], "done": False})
+                if not items or len(items) > 2000:
+                    raise ValueError("Catalogue requires 1 to 2000 ordinary web tabs")
                 await embedding_digest(STATE)
                 async with httpx.AsyncClient(base_url=OLLAMA, timeout=180, trust_env=False) as client:
                     await _gemma_digest(client, STATE)
-                job = {"id": secrets.token_hex(8), "state": "running", "items": items}
+                job = {"id": secrets.token_hex(8), "state": "running", "items": items,
+                       "instruction": instruction, "categories": categories, "close_after_index": close_after_index}
                 store.save_job(job)
                 catalogue_tasks[job["id"]] = asyncio.create_task(run_catalogue(job["id"]))
             else:
@@ -805,15 +870,30 @@ def create_app(token: str, origin: str, database: Path | None = None):
                             break
                     job = store.get_job(job_id)
                     active = not catalogue_tasks[job_id].done()
-                if action == "cancel":
+                if action == "apply":
+                    if active or job["state"] != "complete" or job.get("close_after_index"):
+                        raise ValueError("Only a completed catalogue of still-open tabs can be grouped")
+                    grouped = {}
+                    for item in job["items"]:
+                        if item["category"] != "Uncategorized":
+                            grouped.setdefault(item["category"], []).append(item["id"])
+                    if not grouped:
+                        return {"grouped": 0, "verified": True}
+                    if len(grouped) > 20:
+                        raise ValueError("More than 20 labels were inferred; rerun with explicit categories")
+                    return await mutate("group_categories", {"categories": [{"title": label, "tabIds": ids} for label, ids in grouped.items()],
+                        "mode": "batch", "expectedUrls": {str(item["id"]): item["url"] for item in job["items"]}})
+                elif action == "cancel":
                     job["state"] = "cancel_requested" if active else "cancelled"
                     store.save_job(job)
                 elif action == "resume":
+                    if "instruction" not in job:
+                        raise ValueError("This job predates text-first cataloguing; start a new catalogue to reuse its local index")
                     if active or any(not task.done() for task in catalogue_tasks.values()):
                         raise ValueError("A catalogue is already running")
                     current = (await bridge.call("capture_browser"))["tabs"]
                     for item in job["items"]:
-                        if item["done"]:
+                        if item.get("closed"):
                             continue
                         matches = [tab for tab in current if tab["id"] == item["id"] and tab["url"] == item["url"]]
                         matches = matches or [tab for tab in current if tab["url"] == item["url"]]
@@ -826,13 +906,16 @@ def create_app(token: str, origin: str, database: Path | None = None):
                 elif not active and job["state"] in {"running", "cancel_requested"}:
                     job["state"] = "interrupted"
                     store.save_job(job)
-            return {"jobId": job["id"], "state": job["state"], "completed": sum(item["done"] for item in job["items"]),
+            return {"jobId": job["id"], "state": job["state"], "phase": job.get("phase", "text"),
+                    "completed": sum(item["done"] for item in job["items"]), "textAssessed": sum(bool(item.get("text_done")) for item in job["items"]),
+                    "screenshotsNeeded": sum(bool(item.get("needs_visual")) for item in job["items"]),
+                    "backupBatches": len(job.get("backups", [])), "closed": sum(bool(item.get("closed")) for item in job["items"]),
                     "total": len(job["items"]), "error": job.get("error")}
         except (RuntimeError, ValueError, KeyError, OSError, sqlite3.Error) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True, open_world_hint=False))
-    async def local_data(action: str = "preview", scope: str = "cache", confirm: bool = False) -> dict:
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True, open_world_hint=False))
+    async def local_data(action: Literal["preview", "delete"] = "preview", scope: Literal["cache", "all"] = "cache", confirm: bool = False) -> dict[str, Any]:
         """Preview/delete local cache or all saved browser data. Ask the user to confirm the preview before confirm=true."""
         if action not in {"preview", "delete"} or scope not in {"cache", "all"}:
             raise ToolError("Choose preview/delete and cache/all. All also removes collections and undo history.")
@@ -844,8 +927,8 @@ def create_app(token: str, origin: str, database: Path | None = None):
             except (OSError, RuntimeError, sqlite3.Error) as error:
                 raise ToolError(str(error)) from error
 
-    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
-    async def undo_last(all_changes: bool = False) -> dict:
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=True, open_world_hint=False))
+    async def undo_last(all_changes: bool = False) -> dict[str, Any]:
         """Revert the latest toolkit mutation, or all retained toolkit changes in reverse order. Keeps the local index."""
         async with operation_lock:
             completed = []
@@ -912,7 +995,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         await bridge.connect(socket, token, origin)
 
     async def health(request):
-        return JSONResponse({"name": "fast-tabber", "version": "0.5.0", "root": str(STATE.parent),
+        return JSONResponse({"name": "fast-tabber", "version": "0.5.1", "root": str(STATE.parent),
             "connected": bridge.peer is not None, "extensionVersion": bridge.extension_version, "pid": os.getpid(),
             "busy": operation_lock.locked() or processing_lock.locked() or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values())})
 
