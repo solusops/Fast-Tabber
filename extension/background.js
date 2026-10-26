@@ -759,14 +759,22 @@ async function connect() {
   if (connecting || socket && socket.readyState < 2) return;
   connecting = true;
   try {
-    const response = await fetch(chrome.runtime.getURL("pairing.json"));
-    if (!response.ok) throw new Error("Run the Fast-Tabber setup command before loading this extension");
-    const pairing = await response.json();
+    await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+    const saved = await chrome.storage.local.get(["pairing", "legacyChecked"]);
+    let pairing = saved.pairing;
+    // Migrate existing unpacked installs; release packages never contain this file.
+    if (!pairing && !saved.legacyChecked && chrome.runtime.getManifest().key) {
+      await chrome.storage.local.set({ legacyChecked: true });
+      const response = await fetch(chrome.runtime.getURL("pairing.json"));
+      if (response.ok) pairing = await response.json();
+    }
+    if (!pairing) return;
     socket = new WebSocket("ws://127.0.0.1:8765/extension");
-    socket.onopen = () => socket.send(JSON.stringify({ token: pairing.token, version: chrome.runtime.getManifest().version }));
+    socket.onopen = () => socket.send(JSON.stringify({ ...pairing, version: chrome.runtime.getManifest().version }));
     socket.onmessage = async ({ data }) => {
       const message = JSON.parse(data);
       if (message.type === "paired") {
+        if (message.token) await chrome.storage.local.set({ pairing: { token: message.token } });
         heartbeat = setInterval(() => {
           if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "ping" }));
         }, 20000);
@@ -789,8 +797,12 @@ async function connect() {
         socket.send(JSON.stringify({ id: message.id, error: error.message }));
       }
     };
-    socket.onclose = () => {
+    socket.onclose = async event => {
       clearInterval(heartbeat);
+      if (event.code === 1008) {
+        await chrome.storage.local.remove("pairing");
+        return;
+      }
       setTimeout(connect, 3000);
     };
     socket.onerror = () => socket.close();
@@ -800,6 +812,20 @@ async function connect() {
 }
 
 chrome.runtime.onStartup.addListener(connect);
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (sender.id !== chrome.runtime.id || message.type !== "pair") return;
+  (async () => {
+    try {
+      if (!/^[0-9a-f]{32}$/.test(message.code)) throw new Error("Paste the 32-character code supplied by your agent");
+      await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+      await chrome.storage.local.set({ pairing: { pairingCode: message.code } });
+      if (socket) socket.close();
+      await connect();
+      respond({ started: true });
+    } catch (error) { respond({ error: error.message }); }
+  })();
+  return true;
+});
 chrome.alarms.create("fast-tabber-reconnect", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "fast-tabber-reconnect") connect(); });
 connect();

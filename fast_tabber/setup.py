@@ -62,10 +62,6 @@ def prepare(root: Path = ROOT):
     else:
         connection = {"token": secrets.token_hex(32), "origin": origin}
         path.write_text(json.dumps(connection, indent=2), encoding="utf-8")
-    pairing = root / "extension" / "pairing.json"
-    pairing.touch(exist_ok=True)
-    private_path(pairing)
-    pairing.write_text(json.dumps({"token": connection["token"]}), encoding="utf-8")
 
     config = {
         "$schema": "https://opencode.ai/config.json",
@@ -108,8 +104,8 @@ def prepare(root: Path = ROOT):
     target = codex / "config.toml"
     if not target.exists():
         target.write_text(
-            '[mcp_servers.fast-tabber]\nurl = "http://127.0.0.1:8765/mcp"\n'
-            'bearer_token_env_var = "FAST_TABBER_TOKEN"\n', encoding="utf-8",
+            '[mcp_servers.fast-tabber]\ncommand = "node"\nargs = [' + json.dumps(str(root / "cli.js")) + ', "mcp"]\n'
+            'startup_timeout_sec = 180\ntool_timeout_sec = 600\n', encoding="utf-8",
         )
     return connection
 

@@ -2,6 +2,10 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fast-Tabber exports</title><link rel="stylesheet" href="popup.css"></head>
 <body><main>
   <h1>Fast-Tabber</h1><p>Export URLs from this Chrome profile.</p>
+  <details><summary>Pair with agent</summary>
+    <label>Code from your agent <input id="pair-code" type="password" autocomplete="off" spellcheck="false" maxlength="32"></label>
+    <button id="pair">Pair</button>
+  </details>
   <label>Format <select id="format"><option value="txt">TXT</option><option value="csv">CSV</option></select></label>
   <button id="tabs">Download open tabs</button>
   <h2>Tab groups</h2>

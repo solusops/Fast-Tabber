@@ -1,4 +1,4 @@
-param([string]$Workspace = (Get-Location).Path, [switch]$StartOnly)
+param([string]$Workspace = (Get-Location).Path, [switch]$StartOnly, [switch]$NoOpenCode)
 $ErrorActionPreference = 'Stop'
 $TabberSource = $PSScriptRoot
 $Workspace = [IO.Path]::GetFullPath($Workspace)
@@ -42,7 +42,7 @@ if (!$StartOnly) {
             New-Item -ItemType Directory -Path (Join-Path $TabberRoot $TabberDirectory) -Force | Out-Null
         }
         Get-ChildItem -LiteralPath (Join-Path $TabberSource 'fast_tabber') -Filter '*.py' | Copy-Item -Destination (Join-Path $TabberRoot 'fast_tabber') -Force
-        foreach ($TabberFile in @('extension\manifest.json','extension\background.js','extension\bookmarks.js','extension\content.js','extension\export.js','extension\popup.html','extension\popup.css','extension\popup.js','.agents\skills\fast-tabber\SKILL.md','requirements.lock.txt','pyproject.toml','package.json','tabber.ps1','opencode-plugin.js','install.ps1','install.cmd','README.md','LICENSE')) {
+        foreach ($TabberFile in @('extension\manifest.json','extension\background.js','extension\bookmarks.js','extension\content.js','extension\export.js','extension\popup.html','extension\popup.css','extension\popup.js','.agents\skills\fast-tabber\SKILL.md','requirements.lock.txt','pyproject.toml','package.json','tabber.ps1','opencode-plugin.js','runtime.js','cli.js','install.ps1','install.cmd','README.md','LICENSE')) {
             Copy-Item -LiteralPath (Join-Path $TabberSource $TabberFile) -Destination (Join-Path $TabberRoot $TabberFile) -Force
         }
     }
@@ -87,7 +87,7 @@ if (!$TabberHealth) {
     }
     if (!$TabberHealth) { throw 'MCP service did not start; inspect .state/server.stderr.log.' }
 }
-if (!$StartOnly) {
+if (!$StartOnly -and !$NoOpenCode) {
     $TabberPlugins = Join-Path $Workspace '.opencode\plugins'
     New-Item -ItemType Directory -Path $TabberPlugins -Force | Out-Null
     $TabberEntry = Join-Path $TabberPlugins 'fast-tabber.js'

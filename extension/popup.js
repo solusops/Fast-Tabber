@@ -101,6 +101,12 @@ async function loadGroups() {
   if (!groups.size) byId("tab-groups").textContent = "No grouped tabs.";
 }
 async function run(action) { try { await action(); } catch (error) { byId("status").textContent = error.message; } }
+byId("pair").onclick = () => run(async () => {
+  const result = await chrome.runtime.sendMessage({ type: "pair", code: byId("pair-code").value.trim() });
+  byId("pair-code").value = "";
+  if (result.error) throw new Error(result.error);
+  byId("status").textContent = "Pairing requested. Ask your agent to confirm the live Chrome connection. If it fails, request a new code.";
+});
 byId("tabs").onclick = () => run(async () => download((await chrome.tabs.query({ windowType: "normal" })).filter(tab => !tab.incognito && tab.url)
   .map(tab => ({ title: tab.title || "", url: cleanUrl(tab.url), folder: "" })), "open-tabs"));
 byId("groups").onclick = () => run(async () => download(await groupRows(), "grouped-tabs", true));

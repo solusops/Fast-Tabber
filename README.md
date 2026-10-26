@@ -6,6 +6,30 @@ Local-first Chrome tabs and bookmarks through your existing MCP agent. Embedding
 
 Prerequisites: Chrome 120+, an MCP-compatible agent, and [uv](https://docs.astral.sh/uv/getting-started/installation/). [Ollama](https://ollama.com/download) is needed for semantic indexing/grouping, not native tab/bookmark operations.
 
+With Node.js 22+, install/start the shared runtime:
+
+```powershell
+npx.cmd -y fast-tabber-toolkit@next setup
+```
+
+OpenCode loads the npm plugin from its existing `opencode.json`:
+
+```json
+{"plugin":["fast-tabber-toolkit@next"]}
+```
+
+Merge this entry into existing plugins. The plugin starts the shared runtime, registers MCP and loads the Skill without selecting a chat model. This adapter targets OpenCode v1 for the local Gemma workflow. Keep your existing model/provider settings.
+
+Codex, Claude Code and other local MCP clients can use the same standard stdio command:
+
+```json
+{"mcpServers":{"fast-tabber":{"command":"npx.cmd","args":["-y","fast-tabber-toolkit@next","mcp"]}}}
+```
+
+For Codex CLI: `codex mcp add fast-tabber -- npx.cmd -y fast-tabber-toolkit@next mcp`. Alternatively add `[mcp_servers.fast-tabber]` to its config with that command/args and `startup_timeout_sec = 180`. The launcher reads credentials locally; no token belongs in chat or this configuration. Install the runtime's `.agents/skills/fast-tabber` directory in Codex's `~/.agents/skills/` or Claude Code's `~/.claude/skills/`, preserving existing skills. Other agents can follow the same portable SKILL.md. A remote/cloud-only executor cannot reach this computer's loopback service without a separate local executor.
+
+Update the local toolkit with `npx.cmd -y fast-tabber-toolkit@next setup` after finishing active browser jobs. Chrome updates a Web Store extension separately and may require user approval for new permissions. Existing unpacked installs require a reload. npm publication and a Chrome Web Store listing are separate releases; until the listing is approved, use the unpacked extension.
+
 Give the release ZIP to OpenCode Build, extract it and run:
 
 ```powershell
@@ -14,7 +38,7 @@ Give the release ZIP to OpenCode Build, extract it and run:
 
 The installer preserves existing agent configuration, creates the Python environment and registers a project plugin. It never downloads models. Restart OpenCode and use `/tabs set up Fast-Tabber` or select Tabber. Your existing chat model is retained. Other MCP clients use the authenticated Streamable HTTP endpoint `http://127.0.0.1:8765/mcp`; the private runtime `.state/connection.json` supplies the bearer token. Install the portable `.agents/skills/fast-tabber` Skill in the client's supported skill directory. Codex can use the generated `.codex/config.toml` with `FAST_TABBER_TOKEN` set locally.
 
-First Chrome pairing: load the runtime's `extension` folder unpacked at `chrome://extensions` and approve site permissions. Setup prints the path and checks the connection again after you reply in agent chat. Other agents on the same machine/profile reuse this pairing. The black-and-white popup exports open tabs, selected or all tab groups, all bookmarks or checked bookmarks as TXT/CSV. Folder checkboxes include nested bookmarks. Grouped exports retain group names. **Enable bookmarks** requests optional Chrome permission; declining does not disable tabs.
+First Chrome pairing: install the extension, or load the runtime's `extension` folder unpacked at `chrome://extensions` while the store listing is pending. Ask the agent to call `browser_setup(action="pair")`. Paste its five-minute, single-use code into the toolbar popup's **Pair with agent** section, click Pair and reply in chat. The agent must verify the actual connection. The browser credential stays in restricted Chrome local storage; no secret file is distributed inside the extension. Existing unpacked pairings migrate automatically. Other agents on the same machine/profile reuse this pairing. The black-and-white popup exports open tabs, selected or all tab groups, all bookmarks or checked bookmarks as TXT/CSV. Folder checkboxes include nested bookmarks. Grouped exports retain group names. **Enable bookmarks** requests optional Chrome permission; declining does not disable tabs.
 
 ## Workflow
 
@@ -36,3 +60,7 @@ SQLite stores metadata, chunks, images, float16 vectors and FTS5 locally. Simila
 Native screenshots may activate Chrome; capture covers a top rectangle capped at 1280×900, scaled to a 1024-pixel longest side. Ollama controls visual token preprocessing; Fast-Tabber does not claim a verified fixed visual-token budget. Model-digest/task-prefix changes require new vectors; cached content remains reusable.
 
 Preview: fresh-machine installation, broad grouping quality and large real-browser performance need user acceptance testing. [DigUp's persistent SQLite/FTS5/vector design](https://github.com/ARahim3/DigUp) informed the approach; no DigUp UI/code is bundled. MIT license. Benchmarking remains deferred.
+
+## Publishing
+
+GitHub Actions runs automated checks and builds the installer ZIP, extension-only ZIP and allowlisted npm tarball. It never includes pairing credentials, indexes or browser data. The manual Publish npm workflow runs checks first and uses npm trusted publishing: configure this repository/workflow and the `npm` environment in the package's npm settings after the initial publication. No npm token is committed. The private repository needs a public privacy/support site before a Chrome Web Store launch; see CHROMEWEBSTORE.md and PRIVACY.md for remaining publisher fields/assets. Store review and account approvals are manual. Actions do not approve Chrome permissions or create model-provider compatibility.

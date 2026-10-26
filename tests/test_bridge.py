@@ -133,7 +133,8 @@ def test_authenticated_extension_heartbeat():
     with TestClient(create_app(TOKEN, ORIGIN)) as client:
         with client.websocket_connect("/extension", headers={"origin": ORIGIN}) as socket:
             socket.send_json({"token": TOKEN})
-            assert socket.receive_json() == {"type": "paired"}
+            paired = socket.receive_json()
+            assert paired["type"] == "paired" and paired["token"] != TOKEN
             socket.send_json({"type": "ping"})
             assert socket.receive_json() == {"type": "pong"}
 

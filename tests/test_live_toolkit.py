@@ -31,6 +31,24 @@ async def call(client, name, arguments=None):
 
 
 @pytest.mark.asyncio
+async def test_agent_neutral_stdio_launcher_keeps_structured_browser_results():
+    from pathlib import Path
+    from mcp import StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    root = Path(__file__).resolve().parent.parent
+    async with stdio_client(StdioServerParameters(command="node", args=[str(root / "cli.js"), "mcp"], cwd=str(root))) as (read, write):
+        async with ClientSession(read, write, read_timeout_seconds=180) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            assert any(tool.name == "group_resources" for tool in tools.tools)
+            result = await session.call_tool("browser_status")
+            assert not result.is_error
+            assert result.structured_content == json.loads(result.content[0].text)
+            assert result.structured_content["connected"]
+
+
+@pytest.mark.asyncio
 async def test_actual_selected_image_cache_export_and_native_group_undo():
     async with connected() as client:
         baseline = await call(client,"browser_status")

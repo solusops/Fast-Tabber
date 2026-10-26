@@ -20,7 +20,7 @@ def test_setup_reuses_pairing_token(tmp_path):
     second = prepare(project)
     assert first == second
     assert len(first["token"]) == 64
-    assert json.loads((project / "extension" / "pairing.json").read_text())["token"] == first["token"]
+    assert not (project / "extension" / "pairing.json").exists()
 
 
 def test_setup_does_not_replace_existing_codex_config(tmp_path):
@@ -55,7 +55,7 @@ def test_pairing_secrets_do_not_inherit_shared_folder_access(tmp_path):
     project = root(tmp_path)
     subprocess.run(["icacls", str(project), "/grant", "*S-1-5-11:(OI)(CI)M"], check=True, capture_output=True)
     prepare(project)
-    for path in (project / ".state" / "connection.json", project / "extension" / "pairing.json"):
+    for path in (project / ".state" / "connection.json",):
         acl = win32security.GetFileSecurity(str(path), win32security.DACL_SECURITY_INFORMATION).GetSecurityDescriptorDacl()
         identities = {win32security.ConvertSidToStringSid(acl.GetAce(index)[2]) for index in range(acl.GetAceCount())}
         assert "S-1-5-11" not in identities, "Authenticated Users can read the pairing secret"

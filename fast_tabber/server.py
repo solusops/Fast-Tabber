@@ -31,6 +31,7 @@ from fast_tabber.index import ContentIndex
 from fast_tabber.library import Library, register_library_tools
 from fast_tabber.onboarding import Onboarding
 from fast_tabber.preflight import OLLAMA
+from fast_tabber.pairing import Pairing
 
 STATE = Path(__file__).resolve().parent.parent / ".state"
 
@@ -327,7 +328,7 @@ class Bridge:
             finally:
                 self.pending.pop(request_id, None)
 
-    async def connect(self, socket: WebSocket, token: str, origin: str):
+    async def connect(self, socket: WebSocket, token: str, origin: str, pairing=None, legacy_token=None):
         if socket.headers.get("origin") != origin or self.peer is not None:
             await socket.close(code=1008)
             return
@@ -335,12 +336,19 @@ class Bridge:
         try:
             auth = await asyncio.wait_for(socket.receive_json(), 5)
             supplied = auth.get("token", "")
-            if not isinstance(supplied, str) or not hmac.compare_digest(supplied, token):
+            valid = isinstance(supplied, str) and (hmac.compare_digest(supplied, token) or
+                    legacy_token is not None and hmac.compare_digest(supplied, legacy_token))
+            if not valid and pairing is not None:
+                valid = pairing.consume(auth.get("pairingCode"))
+            if not valid:
+                await socket.close(code=1008)
+                return
+            if self.peer is not None:
                 await socket.close(code=1008)
                 return
             self.peer = socket
             self.extension_version = auth.get("version") if isinstance(auth.get("version"), str) else None
-            await socket.send_json({"type": "paired"})
+            await socket.send_json({"type": "paired", **({"token": token} if pairing is not None else {})})
             while True:
                 message = await socket.receive_json()
                 if message.get("type") == "ping":
@@ -398,6 +406,7 @@ class LocalAuthentication:
 
 def create_app(token: str, origin: str, database: Path | None = None):
     bridge = Bridge()
+    pairing = Pairing(token)
     store = StateStore(database or (STATE / "browser.sqlite3"))
     operation_lock = asyncio.Lock()
     index_lock = asyncio.Lock()
@@ -417,7 +426,7 @@ def create_app(token: str, origin: str, database: Path | None = None):
         return decorate
     serialized_processing = serialized(processing_lock)
     serialized_catalogue = serialized(catalogue_control_lock)
-    mcp = MCPServer("fast-tabber", version="0.6.0", instructions="Manage Chrome tabs and explicitly requested bookmarks. Local EmbeddingGemma supplies indexing; the connected agent supplies reasoning. Keep results bounded and user tabs open during grouping.")
+    mcp = MCPServer("fast-tabber", version="0.7.0", instructions="Manage Chrome tabs and explicitly requested bookmarks. Local EmbeddingGemma supplies indexing; the connected agent supplies reasoning. Keep results bounded and user tabs open during grouping.")
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, open_world_hint=True))
     async def onboarding(action: Literal["status", "download", "verify", "browser", "acknowledge_privacy"] = "status",
@@ -431,9 +440,10 @@ def create_app(token: str, origin: str, database: Path | None = None):
             except RuntimeError as error:
                 return {"connected": False, "verified": False, "error": str(error),
                         "extensionFolder": str(STATE.parent / "extension"),
-                        "steps": ["Open your normal Chrome profile", "Open chrome://extensions and enable Developer mode",
-                                  "If Fast-Tabber is absent, Load unpacked using extensionFolder; otherwise enable/reload it",
-                                  "Approve any requested permissions", "Reply in this agent chat when ready; the agent must call onboarding(action='browser') again"],
+                        "steps": ["Open your normal Chrome profile and install/enable Fast-Tabber",
+                                  "Until the store listing is live, load extensionFolder unpacked at chrome://extensions",
+                                  "Approve any requested permissions", "Call browser_setup(action='pair') and paste the code in the extension's Pair with agent section",
+                                  "Reply in this agent chat when ready; the agent must call onboarding(action='browser') again"],
                         "awaitingUserReply": True}
         return await setup.call(action, model, confirm)
 
@@ -485,9 +495,11 @@ def create_app(token: str, origin: str, database: Path | None = None):
         except (RuntimeError, ValueError) as error:
             raise ToolError(str(error)) from error
 
-    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=True, open_world_hint=False))
-    async def browser_setup(action: str = "reload_extension") -> dict[str, Any]:
-        """Reload the already paired Chrome extension after a local toolkit update; requires no Computer Use."""
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(destructive_hint=False, open_world_hint=False))
+    async def browser_setup(action: Literal["reload_extension", "pair"] = "reload_extension") -> dict[str, Any]:
+        """Issue a five-minute single-use pairing code, or reload an already paired unpacked extension."""
+        if action == "pair":
+            return {**pairing.issue(), "extensionOrigin": origin}
         if action != "reload_extension":
             raise ToolError("action must be reload_extension")
         async with operation_lock:
@@ -715,10 +727,10 @@ def create_app(token: str, origin: str, database: Path | None = None):
     app = mcp.streamable_http_app(json_response=True, stateless_http=True)
 
     async def extension(socket):
-        await bridge.connect(socket, token, origin)
+        await bridge.connect(socket, pairing.token, origin, pairing, legacy_token=token)
 
     async def health(request):
-        return JSONResponse({"name": "fast-tabber", "version": "0.6.0", "root": str(STATE.parent),
+        return JSONResponse({"name": "fast-tabber", "version": "0.7.0", "root": str(STATE.parent),
             "connected": bridge.peer is not None, "extensionVersion": bridge.extension_version, "pid": os.getpid(),
             "busy": operation_lock.locked() or processing_lock.locked() or inference_lock.locked() or any(not task.done() for task in catalogue_tasks.values())})
 
